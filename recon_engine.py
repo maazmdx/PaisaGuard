@@ -13,7 +13,7 @@ TWO_PLACES = Decimal("0.01")
 def round_curr(val: Decimal) -> Decimal:
     return val.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
-def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH) -> dict:
+def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accumulator: bool = False) -> dict:
     """
     Executes the deterministic 4-Pass Reconciliation Engine:
       Pass 1: Key & Gross Amount Verification (OMS vs Razorpay)
@@ -47,12 +47,36 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH) -> dict:
     settle_by_order = {row["order_id"]: row for _, row in df_settle.iterrows() if row["order_id"]}
     oms_by_order = {row["order_id"]: row for _, row in df_oms.iterrows()}
 
+    # Ensure audit and runs schema exists
+    with get_db_cursor(db_path) as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reconciliation_runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_timestamp TEXT NOT NULL,
+                total_audited INTEGER NOT NULL,
+                matched_count INTEGER NOT NULL,
+                exception_count INTEGER NOT NULL,
+                match_rate REAL NOT NULL,
+                sub_paise_accumulator REAL NOT NULL,
+                gst_daily_aggregate REAL NOT NULL,
+                gst_monthly_invoice REAL NOT NULL,
+                gst_tax_leakage REAL NOT NULL,
+                status TEXT NOT NULL
+            );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_recon_runs_ts ON reconciliation_runs(run_timestamp);")
+        
+        # Read latest accumulator audit state for continuous multi-cycle reconciliation
+        prior_run = cursor.execute(
+            "SELECT sub_paise_accumulator FROM reconciliation_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone() if not reset_accumulator else None
+
     # Contract parameters: Standard 2.0% MDR + 18% GST
     contract_mdr_rate = Decimal("0.020")
     gst_rate = Decimal("0.18")
 
     # Rolling sub-paise accumulator to safely absorb cumulative fractional rounding
-    rolling_sub_paise_drift = Decimal("0.0000")
+    rolling_sub_paise_drift = Decimal(str(prior_run[0])) if prior_run and prior_run[0] is not None else Decimal("0.0000")
 
     recon_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -248,7 +272,11 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH) -> dict:
         import json
         json.dump(tax_report, f, indent=2)
 
-    # Update reconciliation_ledger in SQLite
+    total_audited = len(df_settle)
+    matched_count = len(matched_records)
+    match_rate = (matched_count / total_audited) * 100 if total_audited > 0 else 0.0
+
+    # Update reconciliation_ledger and record audit trail in SQLite
     with get_db_cursor(db_path) as cursor:
         cursor.execute("DELETE FROM reconciliation_ledger;")
         cursor.executemany("""
@@ -258,10 +286,17 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH) -> dict:
                 sub_paise_drift, exception_code, exception_msg, reconciled_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """, ledger_entries)
-
-    total_audited = len(df_settle)
-    matched_count = len(matched_records)
-    match_rate = (matched_count / total_audited) * 100 if total_audited > 0 else 0.0
+        cursor.execute("""
+            INSERT INTO reconciliation_runs (
+                run_timestamp, total_audited, matched_count, exception_count,
+                match_rate, sub_paise_accumulator, gst_daily_aggregate,
+                gst_monthly_invoice, gst_tax_leakage, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED');
+        """, (
+            recon_timestamp, total_audited, matched_count, len(exception_records),
+            round(match_rate, 2), float(rolling_sub_paise_drift), round(float(total_daily_tax), 2),
+            round(float(monthly_invoice_tax), 2), gst_tax_leakage
+        ))
 
     summary = {
         "total_audited": total_audited,

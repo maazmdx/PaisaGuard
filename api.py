@@ -3,13 +3,21 @@ import hmac
 import hashlib
 import base64
 import json
+import logging
 import sqlite3
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Header, Request, status
+from fastapi import FastAPI, HTTPException, Header, Request, Response, status
 from pydantic import BaseModel, Field
 from pathlib import Path
 from db import get_db_connection, get_db_cursor, DEFAULT_DB_PATH
 from recon_engine import execute_reconciliation_pipeline
+
+# Configure Structured Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"paisaguard-api","message":%(message)s}'
+)
+logger = logging.getLogger("paisaguard.gateway")
 
 app = FastAPI(
     title="PaisaGuard Gateway",
@@ -17,8 +25,11 @@ app = FastAPI(
     version="2.1.0"
 )
 
-# Webhook Secret Configuration
+# Webhook Secret & Environment Configuration
+ENVIRONMENT = os.environ.get("PAISAGUARD_ENV", "development").lower()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "rzp_sec_buildathon_2026_demo")
+if ENVIRONMENT == "production" and RAZORPAY_WEBHOOK_SECRET == "rzp_sec_buildathon_2026_demo":
+    raise RuntimeError("CRITICAL SECURITY VIOLATION: Default demo webhook secret cannot be used in production environment!")
 
 class WebhookPayload(BaseModel):
     event: str = Field(..., json_schema_extra={"example": "payment.captured"})
@@ -140,7 +151,12 @@ async def ingest_webhook(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid webhook JSON structure: {e}")
 
-    net_amt = payload.amount - (payload.fee + payload.tax)
+    # Defensive normalization of currency amounts (handling None/missing values safely)
+    fee_val = float(payload.fee if payload.fee is not None else 0.0)
+    tax_val = float(payload.tax if payload.tax is not None else 0.0)
+    amount_val = float(payload.amount if payload.amount is not None else 0.0)
+    net_amt = amount_val - (fee_val + tax_val)
+    method_val = payload.payment_method or "upi"
     
     with get_db_cursor(DEFAULT_DB_PATH) as cursor:
         cursor.execute("""
@@ -158,12 +174,23 @@ async def ingest_webhook(
         """, (
             payload.payment_id,
             payload.order_id,
-            payload.amount,
-            payload.fee,
-            payload.tax,
+            amount_val,
+            fee_val,
+            tax_val,
             net_amt,
-            payload.payment_method
+            method_val
         ))
+
+    logger.info(json.dumps({
+        "event": "webhook_ingested",
+        "payment_id": payload.payment_id,
+        "order_id": payload.order_id,
+        "amount": amount_val,
+        "fee": fee_val,
+        "tax": tax_val,
+        "net_amount": net_amt,
+        "hmac_verified": bool(x_razorpay_signature)
+    }))
         
     return {
         "status": "success",
@@ -241,6 +268,32 @@ def get_metrics():
         }
     finally:
         conn.close()
+
+@app.get("/metrics/prometheus")
+def get_prometheus_metrics():
+    """Prometheus-compatible plain text metrics exposition."""
+    m = get_metrics()
+    lines = [
+        "# HELP paisaguard_oms_orders_total Total number of internal OMS orders",
+        "# TYPE paisaguard_oms_orders_total counter",
+        f"paisaguard_oms_orders_total {m['total_oms_orders']}",
+        "# HELP paisaguard_settlements_total Total gateway settlements ingested",
+        "# TYPE paisaguard_settlements_total counter",
+        f"paisaguard_settlements_total {m['total_settlements']}",
+        "# HELP paisaguard_matched_transactions_total Total verified and matched transactions",
+        "# TYPE paisaguard_matched_transactions_total counter",
+        f"paisaguard_matched_transactions_total {m['matched_transactions']}",
+        "# HELP paisaguard_exceptions_total Current exceptions pending in queue",
+        "# TYPE paisaguard_exceptions_total gauge",
+        f"paisaguard_exceptions_total {m['exception_count']}",
+        "# HELP paisaguard_match_rate_percent Current reconciliation match percentage",
+        "# TYPE paisaguard_match_rate_percent gauge",
+        f"paisaguard_match_rate_percent {m['match_rate']}",
+        "# HELP paisaguard_active_rules Total precomputed override rules active",
+        "# TYPE paisaguard_active_rules gauge",
+        f"paisaguard_active_rules {m['active_rules']}"
+    ]
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain")
 
 @app.post("/rules/resolve")
 def add_resolution_rule(req: RuleOverrideRequest):

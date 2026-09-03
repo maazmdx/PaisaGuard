@@ -56,3 +56,18 @@ jobs:
           exit 1
         fi
         echo "Reconcile pipeline verified successfully!"
+
+    - name: Execute Adversarial Multi-Threaded Concurrency Benchmark
+      run: |
+        python concurrency_tester.py
+        if [ ! -f out/concurrency-benchmark.json ]; then
+          echo "Error: concurrency benchmark output missing!"
+          exit 1
+        fi
+
+    - name: Upload Reconciled Audit Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: paisaguard-audit-artifacts
+        path: out/
+

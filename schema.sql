@@ -62,7 +62,22 @@ CREATE TABLE IF NOT EXISTS reconciliation_ledger (
     reconciled_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_timestamp TEXT NOT NULL,
+    total_audited INTEGER NOT NULL,
+    matched_count INTEGER NOT NULL,
+    exception_count INTEGER NOT NULL,
+    match_rate REAL NOT NULL,
+    sub_paise_accumulator REAL NOT NULL,
+    gst_daily_aggregate REAL NOT NULL,
+    gst_monthly_invoice REAL NOT NULL,
+    gst_tax_leakage REAL NOT NULL,
+    status TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_oms_orders_created ON oms_orders(created_at);
 CREATE INDEX IF NOT EXISTS idx_rp_settlements_order_id ON razorpay_settlements(order_id);
 CREATE INDEX IF NOT EXISTS idx_rp_settlements_settled ON razorpay_settlements(settled_at);
 CREATE INDEX IF NOT EXISTS idx_recon_ledger_status ON reconciliation_ledger(reconciled_status);
+CREATE INDEX IF NOT EXISTS idx_recon_runs_ts ON reconciliation_runs(run_timestamp);

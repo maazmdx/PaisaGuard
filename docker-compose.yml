@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  paisaguard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paisaguard_app
+    ports:
+      - "8001:8001"
+      - "8501:8501"
+    environment:
+      - PAISAGUARD_ENV=development
+      - RAZORPAY_WEBHOOK_SECRET=rzp_sec_buildathon_2026_demo
+    volumes:
+      - ./out:/app/out
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped

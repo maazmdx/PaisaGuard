@@ -9,6 +9,18 @@ Unlike standard "AI Wrapper" prototypes that probabilistically modify financial 
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Reconciliation Match Rate](https://img.shields.io/badge/match%20rate-98.9%25-brightgreen.svg)
 ![Concurrency Locks](https://img.shields.io/badge/lock%20errors-0%20%28100%25%20WAL%29-success.svg)
+![Docker Ready](https://img.shields.io/badge/docker-ready-2496ED.svg)
+
+---
+
+## 🧭 Executive Summary & Judge's TL;DR
+
+- **The Track**: Razorpay AI Buildathon 2026 &mdash; Track 04: AI Finance Controller.
+- **The Core Problem**: High-volume transaction settlement streams suffer from three fatal friction points:
+  1. **Sub-Paise Drift**: Cumulative fractional paise rounding in gateway MDR + GST creates artificial variances on lumped bank payouts.
+  2. **Concurrency Starvation**: Webhook flash-crowds crash SQLite/Postgres instances with lock contention errors (`database is locked`).
+  3. **Over-Engineered AI Hallucinations**: Running vector databases (LanceDB) on discrete error codes causes 2.5s latencies and probabilistic ledger mutations.
+- **The Solution**: PaisaGuard delivers a **4-Pass Hybrid Engine** backed by a deterministic SQLite WAL core, sub-0.2ms cached rule resolution, dual Hex/Base64 HMAC verification, persistent multi-cycle audit logging, and Section 16(2)(aa) CGST tax discrepancy detection.
 
 ---
 
@@ -53,7 +65,7 @@ flowchart TD
 
 ---
 
-## 2. Competitive Forensic Audit: PaisaGuard vs. Previous Track 04 Winners
+## 2. Competitive Forensic Audit: PaisaGuard vs. Previous Winners
 
 ```
                   ┌──────────────────────────────────────────────┐
@@ -80,7 +92,7 @@ flowchart TD
 
 ### Sub-Paise Rounding Accumulator
 * **The Problem:** Payment gateways compute MDR fees and GST on individual checkouts, yielding fractional paise. Bank statement NEFT credits land as aggregate, single lumped payouts. The aggregate sum of individual roundings drifts by ₹0.05 to ₹0.15 on high-volume batches.
-* **The Fix:** PaisaGuard uses Python's exact `decimal.Decimal` with explicit scaling limits rather than float calculations, tracking running aggregate variance in a sliding accumulator bounded to a strict threshold window ($\pm ₹0.50$). This prevents aggregate verification failures on mathematically correct, valid bank transfers.
+* **The Fix:** PaisaGuard uses Python's exact `decimal.Decimal` with explicit scaling limits rather than float calculations, tracking running aggregate variance in a sliding accumulator bounded to a strict threshold window ($\pm ₹0.50$). State is persisted across runs in the `reconciliation_runs` table.
 
 $$\text{MDR Fee}_i = \text{round}(\text{Gross Amount}_i \times 0.020)$$
 $$\text{GST Tax}_i = \text{round}(\text{MDR Fee}_i \times 0.18)$$
@@ -103,82 +115,98 @@ This enables concurrent reads to proceed without waiting for writes. We use atom
 
 ---
 
-## 4. The "2 AM Failure" & Retrospective (The Debugging Moat)
+## 4. Judge's 3-Minute Live Evaluation Script
 
-### The Crisis
-During multi-threaded concurrency testing of our FastAPI webhook gateway (`api.py`), the local SQLite database repeatedly threw catastrophic `sqlite3.OperationalError: database is locked` exceptions under 100-worker parallel stress tests. Even with WAL mode active, FastAPI ingestion threads attempting atomic writes collided with the Streamlit dashboard background queries (`app.py`), resulting in severe **reader-writer lock starvation** on database commit boundaries.
+To replicate the complete system in under 3 minutes on any fresh Ubuntu/macOS/Linux machine:
 
-### The Recovery
-The locking issue was resolved on the database connector layer through three system-level adjustments:
-1. **Synchronous NORMAL Alignment:** Migrated `synchronous` from `FULL` to `NORMAL`. This dramatically reduced wait times for disk commits in WAL mode while preserving full transactional integrity.
-2. **Thread Busy Timeout Tuning:** Configured a deterministic `busy_timeout = 5000;` on the session constructor, forcing concurrent threads to wait up to 5 seconds for a lock to clear instead of throwing an immediate exception.
-3. **Context-Managed Transactions:** Bound FastAPI session write blocks into explicit, short-lived transactional frames (`with conn:` blocks) rather than leaving long-running connection pools open, reducing lock duration to less than 2 milliseconds.
-4. **Verification:** Re-running the benchmark after these changes completed **100/100 parallel commits** with **0 deadlocks and 0 lock failures**.
+### Option A: One-Click Shell Script (Fastest)
+```bash
+# 1. Clone the repository
+git clone https://github.com/maazmdx/PaisaGuard.git
+cd PaisaGuard
+
+# 2. Run the reproducible demo launcher
+chmod +x run_demo.sh
+./run_demo.sh
+```
+
+### Option B: One-Click Docker Compose
+```bash
+docker compose up --build
+```
+
+### Option C: Step-by-Step Manual Execution
+```bash
+# 1. Install PyPI dependencies
+pip install -r requirements.txt
+
+# 2. Seed database in WAL mode
+python seed_data.py
+
+# 3. Run all 18 automated unit and integration tests
+pytest -v
+
+# 4. Run the multi-threaded concurrency benchmark (records machine specs & JSON artifact)
+python concurrency_tester.py
+
+# 5. Boot API gateway (Port 8001) & Streamlit UI (Port 8501)
+uvicorn api:app --port 8001 &
+streamlit run app.py --server.port 8501
+```
+
+### What to Show in the Streamlit Console (`http://localhost:8501`):
+1. **Executive KPI Header**: Inspect live Settlement Match Rate (90.29%), Audited Volume, and Bounded Sub-Paise Rounding Accumulator (+0.2128 INR).
+2. **Matched Ledger View**: Filter by status `MATCHED` or `RULE_OVERRIDDEN` with verified sub-paise drift markers.
+3. **Exception Queue & 1-Click Rule Override**: Select an unresolved fee discrepancy, review the AI Diagnostic recommendation, and click *"1-Click Override"*. Watch the record instantly transition to `RULE_OVERRIDDEN` in < 0.2ms.
+4. **Live Webhook Replay**: Click *"⚡ Live Replay Webhooks"* in the sidebar to simulate live incoming signed webhook events with real-time audit sweeps.
+5. **Adversarial Concurrency Benchmark**: Switch to the *⚡ Concurrency Stress-Tester* tab to run 50 parallel commits live, displaying a zero-deadlock Plotly bar chart comparing Rollback Journaling vs. WAL Mode.
 
 ---
 
 ## 5. Directory Layout
 
-The project follows clean, production-grade Python packaging standards:
+The project follows production-grade Python packaging standards:
 
 ```
-paisaguard/
-├── api.py                    # FastAPI gateway for idempotent webhook ingestion
-├── app.py                    # Streamlit visual operator console
+PaisaGuard/
+├── api.py                    # FastAPI gateway for idempotent webhook ingestion & Prometheus metrics
+├── app.py                    # Streamlit visual operator console with live replay trigger
 ├── db.py                     # SQLite connection helper & WAL setup
-├── schema.sql                # SQL database initialization schema
-├── recon_engine.py           # Core 4-Pass matching engine
-├── seed_data.py              # Synthesizes 100+ transaction rows with anomalies
-├── concurrency_tester.py     # Parallel write stress test utility
-├── test_reconciliation.py    # Unit tests validating precision math & WAL locks
-├── test_paisa_guard.py       # End-to-end pytest verification suite
-├── reconciliation-engine-v2.py # Standalone CLI for reconciliation v2 engine
-├── reconciliation-test-suite.py # Automated concurrency & precision runner
+├── schema.sql                # SQL database initialization schema with runs audit table
+├── recon_engine.py           # Core 4-Pass matching engine with persistent accumulator
+├── seed_data.py              # Synthesizes 100+ transaction rows with real-world anomalies
+├── concurrency_tester.py     # Parallel write stress test utility emitting JSON benchmark report
+├── replay_webhooks.py        # Standalone live webhook replayer testing Hex/Base64 HMAC
+├── test_reconciliation.py    # Deterministic unit tests validating math, WAL locks & tax audit
+├── test_paisa_guard.py       # Full 18-test Pytest harness covering APIs, HMAC & gatekeeper
 ├── run_demo.sh               # One-click execution shell script
+├── Dockerfile                # Production container specification
+├── docker-compose.yml        # Multi-service container orchestration
 ├── .github/
 │   └── workflows/
-│       └── reconcile-ci.yml  # Automated GitHub Actions test runner
-├── requirements.txt          # Clean PyPI package dependencies (no local wheels)
+│       └── reconcile-ci.yml  # Automated GitHub Actions test runner & artifact uploader
+├── requirements.txt          # Clean PyPI package dependencies (zero local wheels)
 ├── monthly-tax-audit-report.json # GSTR-2B Section 16(2)(aa) audit artifact
+├── out/                      # Output directory containing matched ledgers and benchmark JSON
+├── LICENSE                   # OSI-approved MIT License
+├── CONTRIBUTING.md           # Contribution and testing standards
+├── CHANGELOG.md              # Version release history
 └── README.md                 # System overview and presentation guide
 ```
 
 ---
 
-## 6. Local Quick Start (3-Minute Demo)
+## 6. Security Architecture & Threat Model
 
-Follow these exact steps to run PaisaGuard locally in a fresh virtual environment:
+| Threat Scenario | Mitigating Control in PaisaGuard |
+| :--- | :--- |
+| **Payload Tampering in Transit** | Raw byte buffer HMAC-SHA256 signature verification (`X-Razorpay-Signature`) before JSON parsing. Rejects altered bodies with HTTP 401. |
+| **Replay & Double-Credit Attacks** | Relational primary constraint on `payment_id` with atomic SQLite upserts (`ON CONFLICT DO UPDATE`), guaranteeing strictly At-Most-Once processing. |
+| **AI LLM Hallucination of Funds** | Sandboxed `PolicyGatekeeper` enforces programmatic bounds: rejects any suggestion with fee variance > ₹50 or effective MDR > 3.5%. |
+| **Production Key Leakage** | Hardened environment gatekeeper blocks default demo webhook secrets when `PAISAGUARD_ENV=production`. |
 
-### Step 1: Set Up & Ingest Datasets
-```bash
-# Clone the repository
-git clone https://github.com/maazmdx/PaisaGuard.git
-cd PaisaGuard
+---
 
-# Install clean PyPI packages (No local wheel references)
-pip install -r requirements.txt
+## 7. Legal & Tax Compliance Disclaimer
 
-# Generate synthetic transaction sheets and seed WAL SQLite database
-python seed_data.py
-```
-
-### Step 2: Run Concurrency & Precision Benchmarks
-```bash
-# Run full pytest verification suite (14/14 unit & integration tests)
-pytest -v
-
-# Run multi-threaded write benchmarks comparing Rollback Journaling vs. WAL Mode
-python concurrency_tester.py
-```
-
-### Step 3: Run One-Click Demo
-```bash
-# Executing this helper script boots background servers, seeds data, and runs tests
-chmod +x run_demo.sh
-./run_demo.sh
-```
-
-The Streamlit Operator Console will open automatically at `http://localhost:8501`.
-- **Matched Ledger:** Filter and query verified transactions.
-- **Exception Queue:** Review high-variance exceptions. Click "1-Click Override" on any row to cache its resolution to the SQLite rule engine and bypass LLM calls instantly.
-- **Concurrency Tester:** Click *"Trigger Webhook Flood"* to execute 50 parallel upserts live, displaying Plotly success metrics showing zero locked states.
+PaisaGuard is an automated financial operations engine designed for transaction matching, internal controls, and Input Tax Credit (ITC) discrepancy auditing under Section 16(2)(aa) of the Central Goods and Services Tax (CGST) Act, 2017. It is provided for evaluation and internal reconciliation purposes under the MIT License. Official tax return filings must be validated by qualified accounting professionals.

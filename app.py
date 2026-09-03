@@ -247,7 +247,20 @@ with st.sidebar:
             generate_financial_dataset(DEFAULT_DB_PATH)
             execute_reconciliation_pipeline(DEFAULT_DB_PATH)
             st.toast("Database restored to default test state.", icon="🔄")
-            st.rerun()
+    if st.button("⚡ Live Replay Webhooks (HMAC Verified)", use_container_width=True):
+        with st.spinner("Injecting simulated webhooks into gateway..."):
+            try:
+                from replay_webhooks import SAMPLE_EVENTS, replay_event
+                replayed = 0
+                for ev in SAMPLE_EVENTS:
+                    status_c, _ = replay_event(ev, "http://127.0.0.1:8001/webhooks/razorpay")
+                    if status_c in (200, 401):
+                        replayed += 1
+                execute_reconciliation_pipeline(DEFAULT_DB_PATH)
+                st.toast(f"Replayed {len(SAMPLE_EVENTS)} signed webhooks into live engine!", icon="⚡")
+                st.rerun()
+            except Exception as ex:
+                st.warning(f"Replayer note: Ensure FastAPI gateway is running on port 8001 (`uvicorn api:app --port 8001`). Details: {ex}")
 
     st.divider()
     st.markdown("### ⚙️ **Engine Architecture**")

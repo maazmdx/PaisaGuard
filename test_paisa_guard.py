@@ -251,4 +251,82 @@ def test_policy_gatekeeper_boundaries():
     assert res_risky["policy_approved"] is False
     assert "exceeds hard safety ceiling" in res_risky["policy_reason"].lower()
 
+def test_defensive_webhook_payload_normalization():
+    """Verifies that missing or None fee/tax fields are safely normalized to 0.0 without crashing."""
+    from fastapi.testclient import TestClient
+    from api import app, RAZORPAY_WEBHOOK_SECRET
+    import json, hmac, hashlib
+    client = TestClient(app)
+
+    payload = {
+        "event": "payment.captured",
+        "payment_id": "pay_defensive_none_001",
+        "order_id": "ord_defensive_001",
+        "amount": 999.00,
+        "fee": None,
+        "tax": None,
+        "payment_method": None
+    }
+    raw_bytes = json.dumps(payload).encode("utf-8")
+    sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
+
+    resp = client.post(
+        "/webhooks/razorpay",
+        content=raw_bytes,
+        headers={"X-Razorpay-Signature": sig, "Content-Type": "application/json"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    assert resp.json()["payment_id"] == "pay_defensive_none_001"
+
+def test_prometheus_metrics_endpoint():
+    """Verifies Prometheus text-format exposition endpoint."""
+    from fastapi.testclient import TestClient
+    from api import app
+    client = TestClient(app)
+
+    resp = client.get("/metrics/prometheus")
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    text = resp.text
+    assert "paisaguard_settlements_total" in text
+    assert "paisaguard_matched_transactions_total" in text
+    assert "paisaguard_match_rate_percent" in text
+
+def test_accumulator_persistence_and_audit_history():
+    """Verifies that reconciliation_runs persists audit trail and tracks sub-paise accumulator across runs."""
+    import sqlite3
+    from recon_engine import execute_reconciliation_pipeline
+    from db import DEFAULT_DB_PATH
+
+    # Execute two consecutive sweeps
+    run1 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
+    run2 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=False)
+
+    conn = sqlite3.connect(str(DEFAULT_DB_PATH))
+    runs = conn.execute("SELECT run_id, sub_paise_accumulator, status FROM reconciliation_runs ORDER BY run_id DESC").fetchall()
+    conn.close()
+
+    assert len(runs) >= 2
+    assert runs[0][2] == "COMPLETED"
+    assert isinstance(runs[0][1], float)
+
+def test_concurrency_benchmark_artifact_generation():
+    """Verifies that the benchmark runner generates out/concurrency-benchmark.json with zero lock errors in WAL mode."""
+    import json
+    from pathlib import Path
+    from concurrency_tester import run_comparative_benchmark
+
+    res_journal, res_wal = run_comparative_benchmark(num_threads=25)
+    assert res_wal["lock_errors"] == 0
+    assert res_wal["successful_commits"] == 25
+
+    artifact = Path(__file__).resolve().parent / "out" / "concurrency-benchmark.json"
+    assert artifact.exists()
+    with open(artifact) as f:
+        data = json.load(f)
+    assert "system_spec" in data
+    assert data["wal_mode"]["lock_errors"] == 0
+
+
 

@@ -1,3 +1,5 @@
+import os
+import sys
 import sqlite3
 import threading
 import time
@@ -136,6 +138,29 @@ def run_comparative_benchmark(num_threads: int = 100):
     print(f"  Database Locks:      {res_wal['lock_errors']}")
     print(f"  Execution Duration:  {res_wal['duration_seconds']}s")
     print(f"  Throughput:          {res_wal['throughput_tps']} txns/sec")
+
+    OUT_DIR = BASE_DIR / "out"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    import platform
+    import json
+
+    benchmark_report = {
+        "benchmark_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "system_spec": {
+            "platform": platform.platform(),
+            "cpu_count": os.cpu_count(),
+            "python_version": sys.version.split()[0],
+            "sqlite_version": sqlite3.sqlite_version
+        },
+        "rollback_journal_mode": res_journal,
+        "wal_mode": res_wal,
+        "verdict": "100% Lock-Free Concurrency Confirmed (0 Deadlocks)" if res_wal["lock_errors"] == 0 else "Lock Contention Detected"
+    }
+    
+    benchmark_file = OUT_DIR / "concurrency-benchmark.json"
+    with open(benchmark_file, "w") as f:
+        json.dump(benchmark_report, f, indent=2)
+    print(f"\n📁 Machine-readable benchmark report saved to: {benchmark_file}")
 
     print("\n" + "=" * 65)
     if res_wal["successful_commits"] == num_threads and res_wal["lock_errors"] == 0:
