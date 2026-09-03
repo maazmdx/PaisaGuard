@@ -171,4 +171,7 @@ def run_comparative_benchmark(num_threads: int = 100):
     return res_journal, res_wal
 
 if __name__ == "__main__":
-    run_comparative_benchmark(100)
+    # Use fewer threads in CI to keep the benchmark fast on 2-CPU runners
+    n_threads = 50 if os.environ.get("PAISAGUARD_CI") else 100
+    run_comparative_benchmark(n_threads)
+

@@ -2,15 +2,17 @@
   "report_title": "PaisaGuard Monthly GST ITC Discrepancy & Tax Audit Report",
   "audit_month": "August 2026",
   "compliance_framework": "Section 16(2)(aa) of CGST Act / GSTR-2B Matching",
-  "audited_at": "2026-09-03 22:41:24",
-  "daily_settlement_aggregate_gst": 1358.41,
+  "audited_at": "2026-09-03 23:07:03",
+  "git_sha": "local",
+  "daily_settlement_aggregate_gst": 1340.05,
   "gstr2b_monthly_invoice_gst": 1333.01,
-  "detected_tax_leakage": 25.4,
+  "detected_tax_leakage": 7.04,
   "status": "DISCREPANCY_DETECTED",
-  "recommended_action": "Dispute notice auto-generated for \u20b925.40 excess deduction on supplier GSTR-1 discrepancy",
+  "recommended_action": "Dispute notice auto-generated for \u20b97.04 excess deduction on supplier GSTR-1 discrepancy",
   "details": {
-    "total_settlements_audited": 104,
+    "total_settlements_audited": 100,
     "discrepancy_direction": "GATEWAY_OVER_DEDUCTION",
     "risk_exposure": "Loss of eligible Input Tax Credit under GSTR-2B reconciliation"
-  }
+  },
+  "run_id": 3
 }

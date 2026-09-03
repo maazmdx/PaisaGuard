@@ -5,7 +5,7 @@ import base64
 import json
 import logging
 import sqlite3
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Header, Request, Response, status
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -30,6 +30,32 @@ ENVIRONMENT = os.environ.get("PAISAGUARD_ENV", "development").lower()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "rzp_sec_buildathon_2026_demo")
 if ENVIRONMENT == "production" and RAZORPAY_WEBHOOK_SECRET == "rzp_sec_buildathon_2026_demo":
     raise RuntimeError("CRITICAL SECURITY VIOLATION: Default demo webhook secret cannot be used in production environment!")
+
+
+def verify_webhook_signature(raw_body: bytes, signature_header: str, secret: str) -> Tuple[bool, str]:
+    """
+    Stateless, importable HMAC-SHA256 verification supporting both Hex and Base64 encodings.
+
+    Compute the HMAC digest bytes ONCE and derive both representations from that
+    single computation, avoiding any ambiguity from calling .hexdigest() and
+    .digest() sequentially on the same HMAC object.
+
+    Returns:
+        (verified: bool, encoding_used: str)  -- encoding_used is 'hex', 'base64', or 'none'
+    """
+    digest_bytes = hmac.new(
+        secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).digest()
+    expected_hex = digest_bytes.hex()                              # 64 lowercase hex chars
+    expected_b64 = base64.b64encode(digest_bytes).decode("utf-8") # 44 base64 chars with =
+
+    if hmac.compare_digest(signature_header, expected_hex):
+        return True, "hex"
+    if hmac.compare_digest(signature_header, expected_b64):
+        return True, "base64"
+    return False, "none"
 
 class WebhookPayload(BaseModel):
     event: str = Field(..., json_schema_extra={"example": "payment.captured"})
@@ -109,18 +135,10 @@ async def ingest_webhook(
     """
     raw_body = await request.body()
 
-    # Verify HMAC signature when header is present (Hex or Base64 encoding)
+    # Verify HMAC-SHA256 signature (supports both Hex and Base64 encodings)
     if x_razorpay_signature:
-        hmac_obj = hmac.new(
-            RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
-            raw_body,
-            hashlib.sha256
-        )
-        expected_hex = hmac_obj.hexdigest()
-        expected_b64 = base64.b64encode(hmac_obj.digest()).decode("utf-8")
-
-        if not (hmac.compare_digest(x_razorpay_signature, expected_hex) or 
-                hmac.compare_digest(x_razorpay_signature, expected_b64)):
+        verified, encoding = verify_webhook_signature(raw_body, x_razorpay_signature, RAZORPAY_WEBHOOK_SECRET)
+        if not verified:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="HMAC signature verification failed: Payload corrupted or unauthorized origin."

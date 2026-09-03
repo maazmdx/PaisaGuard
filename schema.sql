@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS reconciliation_ledger (
 CREATE TABLE IF NOT EXISTS reconciliation_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_timestamp TEXT NOT NULL,
+    git_sha TEXT DEFAULT 'local',
     total_audited INTEGER NOT NULL,
     matched_count INTEGER NOT NULL,
     exception_count INTEGER NOT NULL,

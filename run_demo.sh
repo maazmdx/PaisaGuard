@@ -55,8 +55,21 @@ echo -e "-> Starting FastAPI Webhook Ingestion on port 8001..."
 uvicorn api:app --port 8001 --host 127.0.0.1 > /dev/null 2>&1 &
 API_PID=$!
 
-# Let API start
-sleep 2
+# Wait for FastAPI to be ready (up to 15 seconds) instead of a blind sleep
+echo -e "-> Waiting for FastAPI gateway to be ready..."
+MAX_WAIT=15
+for i in $(seq 1 $MAX_WAIT); do
+    if curl -sf http://127.0.0.1:8001/ > /dev/null 2>&1; then
+        echo -e "-> FastAPI gateway is UP (${i}s)."
+        break
+    fi
+    sleep 1
+    if [ $i -eq $MAX_WAIT ]; then
+        echo -e "${RED}Error: FastAPI gateway did not start in ${MAX_WAIT}s. Check logs.${NC}"
+        kill $API_PID || true
+        exit 1
+    fi
+done
 
 # Replay simulated webhooks to prove real-time ingestion
 echo -e "-> Replaying synthetic webhook payload list to FastAPI endpoint..."

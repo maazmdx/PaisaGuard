@@ -26,6 +26,8 @@ jobs:
         pip install -r requirements.txt
 
     - name: Database Initialization & Synthetic Data Ingestion
+      env:
+        GIT_SHA: ${{ github.sha }}
       run: |
         python seed_data.py
 
@@ -38,6 +40,8 @@ jobs:
         pytest -v
 
     - name: Run Reconciliation Matching Engine Pipeline
+      env:
+        GIT_SHA: ${{ github.sha }}
       run: |
         python recon_engine.py
 
@@ -57,13 +61,18 @@ jobs:
         fi
         echo "Reconcile pipeline verified successfully!"
 
-    - name: Execute Adversarial Multi-Threaded Concurrency Benchmark
+    - name: Execute Adversarial Concurrency Benchmark (CI-Sized: 50 threads)
+      env:
+        PAISAGUARD_CI: "1"
+        GIT_SHA: ${{ github.sha }}
       run: |
         python concurrency_tester.py
         if [ ! -f out/concurrency-benchmark.json ]; then
           echo "Error: concurrency benchmark output missing!"
           exit 1
         fi
+        echo "--- Benchmark Summary ---"
+        python -c "import json; d=json.load(open('out/concurrency-benchmark.json')); print(f\"WAL lock_errors={d['wal_mode']['lock_errors']} successful={d['wal_mode']['successful_commits']} verdict={d['verdict']}\")"
 
     - name: Upload Reconciled Audit Artifacts
       uses: actions/upload-artifact@v4
@@ -71,3 +80,9 @@ jobs:
         name: paisaguard-audit-artifacts
         path: out/
 
+    - name: Print Artifact Manifest
+      run: |
+        echo "=== Artifacts produced ==="
+        ls -lh out/
+        echo "=== Tax Audit Provenance ==="
+        python -c "import json; d=json.load(open('out/monthly-tax-audit-report.json')); print(f\"run_id={d.get('run_id')} git_sha={d.get('git_sha')} leakage=INR{d['detected_tax_leakage']}\")"

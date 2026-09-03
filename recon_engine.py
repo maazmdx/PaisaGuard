@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import pandas as pd
 from decimal import Decimal, ROUND_HALF_UP
@@ -48,11 +49,13 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
     oms_by_order = {row["order_id"]: row for _, row in df_oms.iterrows()}
 
     # Ensure audit and runs schema exists
+    git_sha = os.environ.get("GIT_SHA", os.environ.get("GITHUB_SHA", "local"))[:40]
     with get_db_cursor(db_path) as cursor:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS reconciliation_runs (
                 run_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_timestamp TEXT NOT NULL,
+                git_sha TEXT DEFAULT 'local',
                 total_audited INTEGER NOT NULL,
                 matched_count INTEGER NOT NULL,
                 exception_count INTEGER NOT NULL,
@@ -254,11 +257,12 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
         "audit_month": "August 2026",
         "compliance_framework": "Section 16(2)(aa) of CGST Act / GSTR-2B Matching",
         "audited_at": recon_timestamp,
+        "git_sha": git_sha,
         "daily_settlement_aggregate_gst": round(float(total_daily_tax), 2),
         "gstr2b_monthly_invoice_gst": round(float(monthly_invoice_tax), 2),
         "detected_tax_leakage": gst_tax_leakage,
         "status": "DISCREPANCY_DETECTED" if gst_tax_leakage != 0 else "BALANCED",
-        "recommended_action": f"Dispute notice auto-generated for ₹{gst_tax_leakage:.2f} excess deduction on supplier GSTR-1 discrepancy" if gst_tax_leakage > 0 else "No tax leakage detected. GSTR-2B reconciles.",
+        "recommended_action": f"Dispute notice auto-generated for \u20b9{gst_tax_leakage:.2f} excess deduction on supplier GSTR-1 discrepancy" if gst_tax_leakage > 0 else "No tax leakage detected. GSTR-2B reconciles.",
         "details": {
             "total_settlements_audited": len(df_settle),
             "discrepancy_direction": "GATEWAY_OVER_DEDUCTION" if gst_tax_leakage > 0 else "NONE",
@@ -266,10 +270,8 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
         }
     }
     with open(tax_report_path, "w") as f:
-        import json
         json.dump(tax_report, f, indent=2)
     with open(root_tax_report_path, "w") as f:
-        import json
         json.dump(tax_report, f, indent=2)
 
     total_audited = len(df_settle)
@@ -288,17 +290,20 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
         """, ledger_entries)
         cursor.execute("""
             INSERT INTO reconciliation_runs (
-                run_timestamp, total_audited, matched_count, exception_count,
+                run_timestamp, git_sha, total_audited, matched_count, exception_count,
                 match_rate, sub_paise_accumulator, gst_daily_aggregate,
                 gst_monthly_invoice, gst_tax_leakage, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED');
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED');
         """, (
-            recon_timestamp, total_audited, matched_count, len(exception_records),
+            recon_timestamp, git_sha, total_audited, matched_count, len(exception_records),
             round(match_rate, 2), float(rolling_sub_paise_drift), round(float(total_daily_tax), 2),
             round(float(monthly_invoice_tax), 2), gst_tax_leakage
         ))
+        run_id = cursor.lastrowid
 
     summary = {
+        "run_id": run_id,
+        "git_sha": git_sha,
         "total_audited": total_audited,
         "matched_count": matched_count,
         "exception_count": len(exception_records),
@@ -310,7 +315,18 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
         "matched_csv": str(matched_path),
         "exception_csv": str(exception_path)
     }
+
+    # Patch run_id into the already-written JSON artifacts for auditor traceability
+    for report_path in (tax_report_path, root_tax_report_path):
+        with open(report_path, "r+") as f:
+            data = json.load(f)
+            data["run_id"] = run_id
+            f.seek(0)
+            json.dump(data, f, indent=2)
+            f.truncate()
+
     return summary
+
 
 if __name__ == "__main__":
     res = execute_reconciliation_pipeline()
