@@ -1,6 +1,7 @@
 import os
 import hmac
 import hashlib
+import base64
 import json
 import sqlite3
 from typing import Dict, Any, Optional
@@ -58,14 +59,15 @@ class PolicyGatekeeper:
 
     @classmethod
     def evaluate(cls, gross_amount: float, actual_fee: float, expected_fee: float, suggested_action: str) -> tuple[bool, str]:
-        fee_variance = actual_fee - expected_fee
-        if fee_variance <= 0:
-            return True, "No economic loss detected."
+        variance = abs(actual_fee - expected_fee)
+        if variance > cls.MAX_ALLOWABLE_OVERRIDE_INR:
+            return False, f"Fee discrepancy ₹{variance:.2f} exceeds hard safety ceiling of ₹{cls.MAX_ALLOWABLE_OVERRIDE_INR:.2f}. Manual CFO sign-off required."
 
-        if fee_variance > cls.MAX_ALLOWABLE_OVERRIDE_INR:
-            return False, f"Fee discrepancy ₹{fee_variance:.2f} exceeds hard safety ceiling of ₹{cls.MAX_ALLOWABLE_OVERRIDE_INR:.2f}. Manual CFO sign-off required."
+        if gross_amount > 0:
+            effective_mdr = actual_fee / gross_amount
+        else:
+            effective_mdr = 0.0
 
-        effective_mdr = actual_fee / gross_amount if gross_amount > 0 else 0.0
         if effective_mdr > cls.MAX_ALLOWABLE_MDR_RATE:
             return False, f"Effective MDR {effective_mdr*100:.2f}% breaches merchant contract cap {cls.MAX_ALLOWABLE_MDR_RATE*100:.2f}%."
 
@@ -89,28 +91,52 @@ async def ingest_webhook(
 ):
     """
     Production-grade webhook ingestion:
-    1. Reads raw byte buffer to guarantee bit-for-bit HMAC SHA256 integrity.
-    2. Enforces atomic relational UPSERT on payment_id to physically eliminate race conditions.
+    1. Reads raw byte buffer to guarantee bit-for-bit HMAC SHA256 integrity before parsing.
+    2. Supports both Base64 and Hex-encoded HMAC digests for universal payment gateway compatibility.
+    3. Handles both flat JSON payloads and standard nested Razorpay event payload schemas.
+    4. Enforces atomic relational UPSERT on payment_id to physically eliminate race conditions.
     """
     raw_body = await request.body()
 
-    # Verify HMAC signature when header is present
+    # Verify HMAC signature when header is present (Hex or Base64 encoding)
     if x_razorpay_signature:
-        expected_sig = hmac.new(
+        hmac_obj = hmac.new(
             RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
             raw_body,
             hashlib.sha256
-        ).hexdigest()
+        )
+        expected_hex = hmac_obj.hexdigest()
+        expected_b64 = base64.b64encode(hmac_obj.digest()).decode("utf-8")
 
-        if not hmac.compare_digest(x_razorpay_signature, expected_sig):
+        if not (hmac.compare_digest(x_razorpay_signature, expected_hex) or 
+                hmac.compare_digest(x_razorpay_signature, expected_b64)):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="HMAC signature verification failed: Payload corrupted or unauthorized origin."
             )
 
     try:
-        body_json = json.loads(raw_body.decode("utf-8"))
-        payload = WebhookPayload(**body_json)
+        body_json = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        if "payload" in body_json and isinstance(body_json["payload"], dict) and "payment" in body_json["payload"]:
+            entity = body_json["payload"]["payment"].get("entity", {})
+            amt = entity.get("amount", 0.0)
+            # In Razorpay native payload, amount is in paise (integer) if > 1000 and has no decimals
+            amt_float = float(amt) / 100.0 if isinstance(amt, int) and amt > 1000 else float(amt)
+            fee_val = entity.get("fee", 0.0)
+            fee_float = float(fee_val) / 100.0 if isinstance(fee_val, int) and fee_val > 100 else float(fee_val)
+            tax_val = entity.get("tax", 0.0)
+            tax_float = float(tax_val) / 100.0 if isinstance(tax_val, int) and tax_val > 100 else float(tax_val)
+            payload = WebhookPayload(
+                event=body_json.get("event", "payment.captured"),
+                payment_id=entity.get("id", "pay_unknown"),
+                order_id=entity.get("order_id"),
+                amount=amt_float,
+                fee=fee_float,
+                tax=tax_float,
+                payment_method=entity.get("method", "upi")
+            )
+        else:
+            payload = WebhookPayload(**body_json)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid webhook JSON structure: {e}")
 

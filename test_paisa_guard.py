@@ -160,7 +160,7 @@ def test_hmac_signature_verification():
     raw_bytes = json.dumps(payload).encode("utf-8")
     valid_sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
 
-    # 1. Valid Signature -> 200 OK
+    # 1. Valid Hex Signature -> 200 OK
     r_valid = client.post(
         "/webhooks/razorpay",
         content=raw_bytes,
@@ -168,6 +168,43 @@ def test_hmac_signature_verification():
     )
     assert r_valid.status_code == 200
     assert r_valid.json()["hmac_verified"] is True
+
+    # 1b. Valid Base64 Signature -> 200 OK
+    import base64
+    valid_b64_sig = base64.b64encode(hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), raw_bytes, hashlib.sha256).digest()).decode("utf-8")
+    r_valid_b64 = client.post(
+        "/webhooks/razorpay",
+        content=raw_bytes,
+        headers={"X-Razorpay-Signature": valid_b64_sig, "Content-Type": "application/json"}
+    )
+    assert r_valid_b64.status_code == 200
+    assert r_valid_b64.json()["hmac_verified"] is True
+
+    # 1c. Nested Razorpay Event Format -> 200 OK
+    nested_payload = {
+        "event": "payment.captured",
+        "payload": {
+            "payment": {
+                "entity": {
+                    "id": "pay_nested_test_99",
+                    "order_id": "ord_in_1002",
+                    "amount": 129950,
+                    "fee": 2599,
+                    "tax": 468,
+                    "method": "card"
+                }
+            }
+        }
+    }
+    nested_bytes = json.dumps(nested_payload).encode("utf-8")
+    nested_sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), nested_bytes, hashlib.sha256).hexdigest()
+    r_nested = client.post(
+        "/webhooks/razorpay",
+        content=nested_bytes,
+        headers={"X-Razorpay-Signature": nested_sig, "Content-Type": "application/json"}
+    )
+    assert r_nested.status_code == 200
+    assert r_nested.json()["payment_id"] == "pay_nested_test_99"
 
     # 2. Tampered Signature -> 401 Unauthorized
     r_tampered = client.post(
