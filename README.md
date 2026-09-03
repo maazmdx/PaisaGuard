@@ -139,6 +139,7 @@ paisaguard/
 ├── seed_data.py                                                 # Synthesizes 100+ transaction rows with anomalies
 ├── concurrency_tester.py                                        # Parallel write stress test utility
 ├── test_reconciliation.py                                       # Unit tests validating precision math & WAL locks
+├── test_paisa_guard.py                                          # Pytest suite validating end-to-end API & pipelines
 ├── reconciliation-engine-v2.py                                  # Standalone CLI for reconciliation v2 engine
 ├── reconciliation-test-suite.py                                 # Automated concurrency & precision runner
 ├── monthly-tax-audit-report.json                                # Section 16(2)(aa) GSTR-2B discrepancy report
@@ -156,8 +157,8 @@ PaisaGuard utilizes highly optimized standard Python packages, making local repl
 ### 1. Set Up Environment & Ingest Data
 ```bash
 # Clone repository and install dependencies
-git clone https://github.com/yourusername/paisaguard.git
-cd paisaguard
+git clone https://github.com/maazmdx/PaisaGuard.git
+cd PaisaGuard
 pip install -r requirements.txt
 
 # Generate synthetic data and seed the SQLite DB
@@ -166,8 +167,8 @@ python seed_data.py
 
 ### 2. Run the Verification Test Suite
 ```bash
-# Run automated tests evaluating WAL concurrency, decimal math, and exception routing
-python -m unittest test_reconciliation.py
+# Run pytest verification suite (14/14 unit & integration tests)
+pytest -v
 
 # Or run the full automated concurrency and stress test suite
 python reconciliation-test-suite.py
