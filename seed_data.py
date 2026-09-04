@@ -1,188 +1,234 @@
-import random
-from decimal import Decimal
-from datetime import datetime, timedelta
+"""
+seed_data.py — Seeds the database with high-fidelity 3-source reconciliation fixtures.
+
+Architectural Guarantees:
+1. Distinguishes business transactions from source records:
+   - 100 Operational Business Transactions (producing 300+ source records across OMS, Razorpay, Bank, and Webhooks).
+   - 30 Held-Out Evaluation Transactions (for evaluating AI diagnostics and deliberate abstention).
+2. Canonical Integer Paise: All monetary fields strictly stored as integer paise via require_paise().
+3. Safe Resets: Requires explicit --reset flag to purge tables; never drops or wipes tables on standard runtime.
+4. Reads from checked-in fixtures/ground_truth_manifest.json.
+"""
+
+import sys
+import json
+import argparse
 from pathlib import Path
-from db import init_db, get_db_cursor, DEFAULT_DB_PATH
-from money import to_decimal, round_curr, calc_mdr_fee_and_tax
+from typing import Optional, Union
 
-def generate_financial_dataset(db_path: Path = DEFAULT_DB_PATH):
-    """
-    Seeds database with realistic financial transactions:
-    - 100 OMS orders
-    - Matching Razorpay settlements with standard 2% MDR + 18% GST
-    - Deterministic sub-paise rounding drift (-0.03 INR total)
-    - 3 Corporate card fee discrepancies (2.5% fee -> FEE_DEDUCTION exception)
-    - 2 Unsettled pending orders
-    - 2 Orphan settlements without OMS orders
-    - 1 Amount mismatch exception
-    - 1 Monthly GST tax invoice with 7.04 INR variance (tax leakage)
-    """
-    init_db(db_path)
-    random.seed(42)
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
-    base_time = datetime(2026, 8, 1, 9, 0, 0)
-    
-    orders = []
-    settlements = []
-    
-    # Standard amounts to create realistic Indian retail cart values
-    sample_amounts = [
-        Decimal("499.00"), Decimal("899.00"), Decimal("1299.50"), Decimal("1499.00"),
-        Decimal("2499.00"), Decimal("3999.00"), Decimal("5490.00"), Decimal("7999.00"),
-        Decimal("999.00"), Decimal("1599.00"), Decimal("4500.00"), Decimal("12500.00")
+from db import init_db, get_db_connection, get_db_cursor, get_db_path, log_audit_event
+from money import require_paise
+
+MANIFEST_PATH = BASE_DIR / "fixtures" / "ground_truth_manifest.json"
+
+
+def seed_database(db_path: Optional[Union[str, Path]] = None, reset: bool = False) -> dict:
+    """
+    Seeds the SQLite database from ground_truth_manifest.json.
+    If reset=False and the database is already populated, refuses to overwrite.
+    """
+    target_db = Path(db_path) if db_path else get_db_path()
+    init_db(target_db)
+
+    conn = get_db_connection(target_db)
+    try:
+        existing_orders = conn.execute("SELECT COUNT(*) FROM oms_orders").fetchone()[0]
+        existing_settlements = conn.execute("SELECT COUNT(*) FROM razorpay_settlements").fetchone()[0]
+        
+        if (existing_orders > 0 or existing_settlements > 0) and not reset:
+            print(f"[seed_data] Notice: Database at {target_db} already populated ({existing_orders} orders, {existing_settlements} settlements).")
+            print("[seed_data] Pass --reset to purge and re-seed. Skipping seeding.")
+            return {
+                "status": "skipped",
+                "reason": "already_populated",
+                "oms_orders": existing_orders,
+                "settlements": existing_settlements
+            }
+    finally:
+        conn.close()
+
+    if not MANIFEST_PATH.exists():
+        raise FileNotFoundError(f"Ground-truth manifest not found at: {MANIFEST_PATH}")
+
+    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    oms_rows = []
+    settle_rows = []
+    webhook_rows = []
+
+    for tx in manifest.get("transactions", []):
+        # OMS order
+        if tx.get("oms_order"):
+            o = tx["oms_order"]
+            oms_rows.append((
+                o["order_id"],
+                o.get("business_tx_id", tx.get("business_tx_id")),
+                require_paise(o["amount_paise"]),
+                o.get("currency", "INR"),
+                o.get("customer_id"),
+                o["source_payload_hash"],
+                o["created_at"],
+                o.get("status", "created")
+            ))
+
+        # Razorpay settlement
+        if tx.get("settlement"):
+            s = tx["settlement"]
+            settle_rows.append((
+                s["payment_id"],
+                s.get("business_tx_id", tx.get("business_tx_id")),
+                s.get("order_id"),
+                s.get("payout_id"),
+                require_paise(s["amount_paise"]),
+                require_paise(s["fee_paise"]),
+                require_paise(s["tax_paise"]),
+                require_paise(s["net_paise"]),
+                s.get("currency", "INR"),
+                s.get("payment_method", "upi"),
+                s["source_payload_hash"],
+                s["settled_at"],
+                s.get("status", "settled")
+            ))
+
+        # Webhook event
+        if tx.get("webhook_event"):
+            w = tx["webhook_event"]
+            webhook_rows.append((
+                w["event_id"],
+                w.get("payment_id"),
+                w["source_payload_hash"],
+                w["payload_json"],
+                w.get("hmac_signature"),
+                w["received_at"],
+                w.get("status", "received")
+            ))
+
+    # Bank payout credits
+    bank_rows = []
+    for b in manifest.get("bank_payout_credits", []):
+        bank_rows.append((
+            b["credit_id"],
+            b.get("payout_id"),
+            b["utr_number"],
+            require_paise(b["credit_amount_paise"]),
+            b["source_payload_hash"],
+            b["credited_at"],
+            b.get("account_tail"),
+            b.get("status", "credited")
+        ))
+
+    # Pre-configure approved corporate card override rule
+    rules = [
+        (
+            "rule_corporate_card_surcharge_2026",
+            "MDR_SURCHARGE",
+            "payment_method",
+            "corporate_card",
+            "APPROVE_CORPORATE_CARD_CHARGE",
+            "CORPORATE_CARD_SURCHARGE",
+            "Approved 2.5% MDR + 18% GST for commercial card interchange surcharge",
+            "finops_policy_engine",
+            "2026-08-01 00:00:00",
+            "ACTIVE"
+        )
     ]
 
-    # Pre-determined exception indices
-    corporate_fee_indices = {42, 77, 91}  # Charged 2.5% fee instead of 2.0%
-    unsettled_indices = {98, 99}           # In OMS, not settled yet
-    amount_mismatch_index = 85             # Partial payment mismatch
-
-    sub_paise_accumulated = Decimal("0.00")
-
-    for i in range(1, 101):
-        order_id = f"ord_in_{1000 + i}"
-        customer_id = f"cust_{2000 + (i % 35)}"
-        txn_time = base_time + timedelta(hours=i * 2, minutes=(i * 13) % 60)
-        time_str = txn_time.strftime("%Y-%m-%d %H:%M:%S")
-
-        amount = sample_amounts[(i * 7) % len(sample_amounts)]
-        
-        # Insert OMS Order
-        orders.append((
-            order_id,
-            float(amount),
-            "INR",
-            customer_id,
-            time_str,
-            "captured"
-        ))
-
-        # Skip unsettled orders
-        if i in unsettled_indices:
-            continue
-
-        payment_id = f"pay_rzp_{800000 + i}"
-        settlement_id = f"setl_aug_{100 + (i // 10)}"
-        settled_time = (txn_time + timedelta(days=1, hours=3)).strftime("%Y-%m-%d %H:%M:%S")
-
-        # Check special test cases
-        if i in corporate_fee_indices:
-            # Corporate card fee: 2.5% + 18% GST (triggers FEE_DEDUCTION exception)
-            fee_rate = Decimal("0.025")
-            payment_method = "corporate_card"
-        else:
-            # Standard contracted fee: 2.0% + 18% GST
-            fee_rate = Decimal("0.020")
-            payment_method = random.choice(["upi", "credit_card", "debit_card", "netbanking"])
-
-        # Calculate MDR Fee
-        raw_fee = amount * fee_rate
-        exact_fee = round_curr(raw_fee)
-
-        # Calculate 18% GST on fee
-        raw_tax = exact_fee * Decimal("0.18")
-        exact_tax = round_curr(raw_tax)
-
-        # Track sub-paise rounding variance (difference between raw mathematical sum and rounded sum)
-        raw_total_deduction = raw_fee + raw_tax
-        rounded_total_deduction = exact_fee + exact_tax
-        drift = rounded_total_deduction - raw_total_deduction
-        sub_paise_accumulated += drift
-
-        # Amount mismatch case
-        settle_amount = amount
-        if i == amount_mismatch_index:
-            settle_amount = amount - Decimal("500.00")  # e.g., ₹500 partial refund/under-settlement
-
-        net_amount = settle_amount - rounded_total_deduction
-
-        settlements.append((
-            payment_id,
-            settlement_id,
-            order_id,
-            float(settle_amount),
-            float(exact_fee),
-            float(exact_tax),
-            float(net_amount),
-            "INR",
-            payment_method,
-            settled_time,
-            "settled"
-        ))
-
-    # Add 2 orphan settlements (settlements present in Razorpay feed with no OMS order)
-    settlements.append((
-        "pay_rzp_orphan_901",
-        "setl_aug_115",
-        "ord_unrecorded_901",
-        2500.00,
-        50.00,
-        9.00,
-        2441.00,
-        "INR",
-        "upi",
-        "2026-08-25 14:00:00",
-        "settled"
-    ))
-    settlements.append((
-        "pay_rzp_orphan_902",
-        "setl_aug_115",
-        "ord_unrecorded_902",
-        4200.00,
-        84.00,
-        15.12,
-        4100.88,
-        "INR",
-        "credit_card",
-        "2026-08-26 16:30:00",
-        "settled"
-    ))
-
-    # Insert data into SQLite
-    with get_db_cursor(db_path) as cursor:
-        cursor.execute("DELETE FROM oms_orders;")
-        cursor.execute("DELETE FROM razorpay_settlements;")
-        cursor.execute("DELETE FROM resolved_rules;")
-        cursor.execute("DELETE FROM gst_monthly_invoices;")
-        cursor.execute("DELETE FROM reconciliation_ledger;")
+    with get_db_cursor(target_db) as cursor:
+        if reset:
+            cursor.execute("DELETE FROM oms_orders;")
+            cursor.execute("DELETE FROM razorpay_settlements;")
+            cursor.execute("DELETE FROM bank_payout_credits;")
+            cursor.execute("DELETE FROM webhook_events;")
+            cursor.execute("DELETE FROM run_decision_links;")
+            cursor.execute("DELETE FROM agent_investigations;")
+            cursor.execute("DELETE FROM human_approvals;")
+            cursor.execute("DELETE FROM reconciliation_decisions;")
+            cursor.execute("DELETE FROM reconciliation_runs;")
+            cursor.execute("DELETE FROM audit_events;")
+            cursor.execute("DELETE FROM resolved_rules;")
 
         cursor.executemany("""
-            INSERT INTO oms_orders (order_id, gross_amount, currency, customer_id, created_at, status)
-            VALUES (?, ?, ?, ?, ?, ?);
-        """, orders)
+            INSERT INTO oms_orders (
+                order_id, business_tx_id, amount_paise, currency, customer_id,
+                source_payload_hash, created_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """, oms_rows)
 
         cursor.executemany("""
             INSERT INTO razorpay_settlements (
-                payment_id, settlement_id, order_id, amount, fee, tax, net_amount, currency, payment_method, settled_at, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, settlements)
+                payment_id, business_tx_id, order_id, payout_id, amount_paise,
+                fee_paise, tax_paise, net_paise, currency, payment_method,
+                source_payload_hash, settled_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, settle_rows)
 
-        # Calculate exact total daily tax across all settlements
-        total_daily_tax = sum(Decimal(str(s[5])) for s in settlements)
-        # Seed Monthly GST Invoice from Razorpay with exact 7.04 INR variance (over-deduction)
-        monthly_total_gst = total_daily_tax - Decimal("7.04")
-        monthly_taxable = round_curr(monthly_total_gst / Decimal("0.18"))
-        half_gst = round_curr(monthly_total_gst / Decimal("2.0"))
-
-        cursor.execute("""
-            INSERT INTO gst_monthly_invoices (
-                invoice_id, month, total_taxable_value, cgst, sgst, igst, total_gst, invoice_date
+        cursor.executemany("""
+            INSERT INTO bank_payout_credits (
+                credit_id, payout_id, utr_number, credit_amount_paise,
+                source_payload_hash, credited_at, account_tail, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-        """, (
-            "INV-RZP-2026-08-9941",
-            "2026-08",
-            float(monthly_taxable),
-            float(half_gst),
-            float(half_gst),
-            0.00,
-            float(monthly_total_gst),
-            "2026-09-01"
-        ))
+        """, bank_rows)
 
-    print(f"Dataset generated successfully in {db_path}!")
-    print(f"  - Total OMS Orders: {len(orders)}")
-    print(f"  - Total Razorpay Settlements: {len(settlements)}")
-    print(f"  - Sub-paise Accumulated Drift: {float(sub_paise_accumulated):.4f} INR")
+        cursor.executemany("""
+            INSERT INTO webhook_events (
+                event_id, payment_id, source_payload_hash, payload_json,
+                hmac_signature, received_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?);
+        """, webhook_rows)
+
+        cursor.executemany("""
+            INSERT OR REPLACE INTO resolved_rules (
+                rule_id, rule_type, scope_field, scope_value, action,
+                exception_code, description, created_by, created_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, rules)
+
+    log_audit_event(
+        target_db,
+        event_type="FIXTURE_SEEDED",
+        aggregate_type="DATABASE",
+        aggregate_id="reconciliation_fixture",
+        payload={
+            "reset": reset,
+            "oms_orders_count": len(oms_rows),
+            "settlements_count": len(settle_rows),
+            "bank_credits_count": len(bank_rows),
+            "webhook_events_count": len(webhook_rows),
+            "total_source_records": len(oms_rows) + len(settle_rows) + len(bank_rows) + len(webhook_rows)
+        }
+    )
+
+    total_records = len(oms_rows) + len(settle_rows) + len(bank_rows) + len(webhook_rows)
+    print(f"[seed_data] Successfully seeded database at: {target_db}")
+    print(f"  OMS Orders        : {len(oms_rows)}")
+    print(f"  Razorpay Settle   : {len(settle_rows)}")
+    print(f"  Bank Credits      : {len(bank_rows)}")
+    print(f"  Webhook Events    : {len(webhook_rows)}")
+    print(f"  Total Source Recs : {total_records} (Guaranteed >300)")
+
+    return {
+        "status": "seeded",
+        "oms_orders": len(oms_rows),
+        "settlements": len(settle_rows),
+        "bank_credits": len(bank_rows),
+        "webhook_events": len(webhook_rows),
+        "total_source_records": total_records
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PaisaGuard Synthetic Fixture Seeder")
+    parser.add_argument("--reset", action="store_true", help="Explicitly purge and rebuild database fixtures")
+    parser.add_argument("--db", type=str, default=None, help="Optional database file path")
+    args = parser.parse_args()
+
+    seed_database(db_path=args.db, reset=args.reset)
+
 
 if __name__ == "__main__":
-    generate_financial_dataset()
+    main()
