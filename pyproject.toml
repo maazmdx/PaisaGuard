@@ -9,3 +9,6 @@ ignore = ["E501", "E402", "F403", "F405"]
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["test_*.py"]
+# NOTE: Do NOT add filterwarnings to suppress StarletteDeprecationWarning.
+# The correct fix is installing a compatible FastAPI/Starlette/HTTPX set.
+# If this warning appears, the wrong package versions are installed.

@@ -30,7 +30,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
@@ -43,7 +43,7 @@ if str(BASE_DIR) not in sys.path:
 from audit_service import record_human_approval
 from db import get_db_connection, get_db_cursor
 from exception_agent import investigate_exception
-from money import format_paise_inr, require_paise
+from money import format_paise_inr, parse_inr_to_paise, require_paise
 from recon_engine import execute_reconciliation_pipeline
 
 # Configure Structured JSON Logging without secret leakage
@@ -53,11 +53,109 @@ logging.basicConfig(
 )
 logger = logging.getLogger("paisaguard.gateway")
 
+
+def _load_local_env_file(filepath: Path = BASE_DIR / ".env") -> None:
+    """Load key-value pairs from .env if it exists, without overriding existing shell environment."""
+    if not filepath.is_file():
+        return
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip("'").strip('"')
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except Exception:
+        pass
+
+
+_load_local_env_file()
+
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
 app = FastAPI(
     title="PaisaGuard FinOps Engine",
     description="3-Source Financial Reconciliation, HMAC Ingestion & AI Diagnostic Controller",
     version="3.0.0",
 )
+
+# Production CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def add_security_headers_and_timing(request: Request, call_next):
+    """Adds security headers and execution timing to every API response."""
+    start_time = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.error(
+            f'{{"event":"unhandled_server_exception","path":"{request.url.path}","error":"{str(exc)}"}}',
+            exc_info=True,
+        )
+        response = JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": "Internal Server Error",
+                "detail": "An unexpected server error occurred. Incident has been safely logged.",
+                "path": request.url.path,
+            },
+        )
+    duration_ms = (time.perf_counter() - start_time) * 1000.0
+    response.headers["X-Process-Time-Ms"] = f"{duration_ms:.2f}"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Global exception safety net to prevent traceback or credential leakage in 500 errors.
+    Logs the incident internally with full stack trace and returns a clean, structured JSON response.
+    """
+    logger.error(
+        f'{{"event":"unhandled_server_exception","path":"{request.url.path}","error":"{str(exc)}"}}',
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal Server Error",
+            "detail": "An unexpected server error occurred. Incident has been safely logged.",
+            "path": request.url.path,
+        },
+    )
+
+
+def _normalize_money_to_paise(val: Any) -> int:
+    """Safely converts arbitrary monetary representations (int paise, float/str rupees, None) into canonical integer paise."""
+    if val is None or isinstance(val, bool):
+        return 0
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return parse_inr_to_paise(f"{val:.2f}")
+    if isinstance(val, str):
+        cleaned = val.strip()
+        if not cleaned:
+            return 0
+        return parse_inr_to_paise(cleaned)
+    return 0
+
 
 # Security Configuration
 ENVIRONMENT = os.environ.get("PAISAGUARD_ENV", "development").lower()
@@ -181,15 +279,21 @@ class HumanApprovalRequest(BaseModel):
 def root():
     has_token = bool(os.environ.get("PAISAGUARD_API_TOKEN", PAISAGUARD_API_TOKEN))
     has_secret = bool(os.environ.get("RAZORPAY_WEBHOOK_SECRET", RAZORPAY_WEBHOOK_SECRET))
+    has_groq = bool(os.environ.get("GROQ_API_KEY", ""))
+    has_gemini = bool(os.environ.get("AI_API_KEY", ""))
+    provider = os.environ.get("AI_PROVIDER", "mock").lower()
     return {
         "system": "PaisaGuard FinOps Engine",
         "status": "operational",
         "version": "3.0.0",
         "environment": ENVIRONMENT,
         "canonical_currency": "integer_paise",
+        "ai_provider": provider,
         "security_policy": {
             "token_configured": has_token,
             "hmac_secret_configured": has_secret,
+            "groq_key_configured": has_groq,
+            "gemini_key_configured": has_gemini,
             "demo_unsigned_allowed": PAISAGUARD_DEMO_ALLOW_UNSIGNED,
         },
     }
@@ -250,10 +354,21 @@ async def ingest_webhook(
         # Support native Razorpay nested entity structure or flat payload
         if "payload" in body_json and "payment" in body_json["payload"]:
             entity = body_json["payload"]["payment"].get("entity", {})
-            event_id = x_razorpay_event_id or body_json.get("event_id") or f"evt_{entity.get('id')}"
+            event_type = body_json.get("event", "event")
+            payment_id_slug = entity.get("id", "unknown")
+            # Stable, collision-free fallback: event-type + payment_id + payload hash prefix.
+            # Prevents payment.captured and payment.settled for the same payment_id from
+            # deduplicating each other (which would silently drop one event).
+            payload_hash_short = hashlib.sha256(raw_body).hexdigest()[:12]
+            event_type_slug = event_type.replace(".", "_")
+            event_id = (
+                x_razorpay_event_id
+                or body_json.get("event_id")
+                or f"evt_{event_type_slug}_{payment_id_slug}_{payload_hash_short}"
+            )
             payload = RazorpayWebhookPayload(
                 event_id=event_id,
-                event=body_json.get("event", "payment.captured"),
+                event=event_type,
                 payment_id=entity.get("id"),
                 order_id=entity.get("order_id"),
                 payout_id=entity.get("payout_id"),
@@ -265,13 +380,31 @@ async def ingest_webhook(
         else:
             if x_razorpay_event_id and "event_id" not in body_json:
                 body_json["event_id"] = x_razorpay_event_id
+            if "event_id" not in body_json:
+                p_id = body_json.get("payment_id", "unknown")
+                h_short = hashlib.sha256(raw_body).hexdigest()[:12]
+                ev_name = str(body_json.get("event", "payment_captured")).replace(".", "_")
+                body_json["event_id"] = f"evt_{ev_name}_{p_id}_{h_short}"
+
+            # Defensive normalization for flat payloads
+            if "amount_paise" not in body_json and "amount" in body_json:
+                body_json["amount_paise"] = _normalize_money_to_paise(body_json.get("amount"))
+            if "fee_paise" not in body_json and "fee" in body_json:
+                body_json["fee_paise"] = _normalize_money_to_paise(body_json.get("fee"))
+            if "tax_paise" not in body_json and "tax" in body_json:
+                body_json["tax_paise"] = _normalize_money_to_paise(body_json.get("tax"))
+
             payload = RazorpayWebhookPayload(**body_json)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid webhook JSON structure: {exc}")
 
     # Compute source payload hash
     source_payload_hash = f"sha256:{hashlib.sha256(raw_body).hexdigest()}"
-    net_paise = payload.amount_paise - (payload.fee_paise + payload.tax_paise)
+    fee_val = payload.fee_paise or 0
+    tax_val = payload.tax_paise or 0
+    net_paise = payload.amount_paise - (fee_val + tax_val)
     now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     with get_db_cursor() as cursor:
@@ -372,6 +505,17 @@ def trigger_ai_investigation(req: AIInvestigateRequest):
     except Exception as exc:
         logger.error(f"AI investigation error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/ai/preflight", summary="AI Provider Safe Preflight Verification")
+def get_ai_preflight_status():
+    """
+    Verifies AI provider configuration safely without exposing any secret API keys.
+    Clearly reports whether the system is in Mock baseline mode or Gemini live-demo mode.
+    """
+    from exception_agent import check_ai_preflight
+
+    return check_ai_preflight()
 
 
 @app.post("/approvals/decision", dependencies=[Depends(verify_api_token)])

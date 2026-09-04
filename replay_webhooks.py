@@ -1,7 +1,4 @@
-#!/usr/bin/env bash
-""" ":
-exec python3 "$0" "$@"
-"""
+#!/usr/bin/env python3
 
 """
 PaisaGuard Webhook Replayer
@@ -90,13 +87,28 @@ SAMPLE_EVENTS = [
         },
     },
     {
+        "name": "Canonical FinOps Integer Paise Event (Hex Signature)",
+        "encoding": "hex",
+        "tamper": False,
+        "payload": {
+            "event_id": "evt_live_canonical_105",
+            "event": "payment.captured",
+            "payment_id": "pay_live_canonical_105",
+            "order_id": "ord_in_1005",
+            "amount_paise": 199900,
+            "fee_paise": 3998,
+            "tax_paise": 720,
+            "payment_method": "upi",
+        },
+    },
+    {
         "name": "Tampered Payload / Man-in-the-Middle Attack (Expect 401 Rejection)",
         "encoding": "hex",
         "tamper": True,
         "payload": {
             "event": "payment.captured",
             "payment_id": "pay_exploit_999",
-            "order_id": "ord_in_1005",
+            "order_id": "ord_in_1006",
             "amount": 99999.00,
             "fee": 1.00,
             "tax": 0.18,

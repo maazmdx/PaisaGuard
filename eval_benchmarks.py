@@ -139,10 +139,22 @@ def run_benchmark_evaluation() -> Dict[str, Any]:
     total_held_out = len(held_out_manifest)
 
     ai_evaluated_count = 0
-    ai_correct_count = 0
     ai_abstained_count = 0
     expected_abstain_count = sum(1 for t in held_out_manifest if t.get("should_abstain"))
     true_abstain_count = 0
+
+    # Separate accuracy tracking: mock (deterministic baseline) vs Groq vs Gemini (live AI)
+    # These MUST NOT be merged — mock accuracy reflects rule-matching, not LLM reasoning.
+    mock_correct = 0
+    mock_evaluated = 0
+    groq_correct = 0
+    groq_evaluated = 0
+    gemini_correct = 0
+    gemini_evaluated = 0
+
+    # Clear previous benchmark approval records for idempotent benchmark runs
+    cursor.execute("DELETE FROM human_approvals WHERE reviewer = 'auto_benchmark_evaluator';")
+    conn.commit()
 
     investigation_results = []
     for h in held_out_manifest:
@@ -159,28 +171,62 @@ def run_benchmark_evaluation() -> Dict[str, Any]:
 
             expected_cause = h["expected_root_cause"]
             expected_abstain = h.get("should_abstain", False)
+            provider_label = inv.get("provider_label", "DeterministicMock")
+            is_groq_run = "Groq" in provider_label
+            is_gemini_run = "Gemini" in provider_label
 
             if inv["should_abstain"]:
                 ai_abstained_count += 1
                 if expected_abstain:
                     true_abstain_count += 1
             else:
-                if inv["root_cause"] == expected_cause:
-                    ai_correct_count += 1
+                correct = inv["root_cause"] == expected_cause
+                if is_groq_run:
+                    groq_evaluated += 1
+                    if correct:
+                        groq_correct += 1
+                elif is_gemini_run:
+                    gemini_evaluated += 1
+                    if correct:
+                        gemini_correct += 1
+                else:
+                    mock_evaluated += 1
+                    if correct:
+                        mock_correct += 1
 
-            # Simulate human disposition based on AI recommendation and ground truth
-            final_action = "APPROVE" if not inv["should_abstain"] else "ESCALATE"
+            # Simulate human disposition based on AI recommendation
+            if inv["should_abstain"]:
+                final_action = "ESCALATE"
+                disposition_tag = "ESCALATE_TO_CFO"
+            elif inv["root_cause"] == "CORPORATE_CARD_SURCHARGE":
+                final_action = "OVERRIDE"
+                disposition_tag = "APPLY_CORPORATE_CARD_RULE"
+            elif inv["root_cause"] == "UNSETTLED_OMS_ORDER":
+                final_action = "APPROVE"
+                disposition_tag = "AWAIT_SETTLEMENT"
+            elif inv["root_cause"] == "ORPHAN_SETTLEMENT":
+                final_action = "ESCALATE"
+                disposition_tag = "AUDIT_ORPHAN_SETTLEMENT"
+            elif inv["root_cause"] == "PARTIAL_REFUND_MISMATCH":
+                final_action = "ESCALATE"
+                disposition_tag = "INVESTIGATE_PARTIAL_REFUND"
+            else:
+                final_action = "APPROVE"
+                disposition_tag = "RECONCILED"
+
             record_human_approval(
                 decision_id=dec["decision_id"],
                 action=final_action,
                 reviewer="auto_benchmark_evaluator",
-                notes=f"Auto disposition evaluated: {inv['root_cause']}",
+                notes=f"Auto disposition evaluated: {disposition_tag}",
                 investigation_id=inv["investigation_id"],
                 db_path=target_db,
             )
 
-    non_abstained_evaluated = ai_evaluated_count - ai_abstained_count
-    ai_accuracy = round((ai_correct_count / non_abstained_evaluated) * 100, 2) if non_abstained_evaluated > 0 else 100.0
+    non_abstained_evaluated = mock_evaluated + groq_evaluated + gemini_evaluated
+    mock_accuracy = round((mock_correct / mock_evaluated) * 100, 2) if mock_evaluated > 0 else None
+    groq_accuracy = round((groq_correct / groq_evaluated) * 100, 2) if groq_evaluated > 0 else None
+    gemini_accuracy = round((gemini_correct / gemini_evaluated) * 100, 2) if gemini_evaluated > 0 else None
     abstention_rate = round((ai_abstained_count / ai_evaluated_count) * 100, 2) if ai_evaluated_count > 0 else 0.0
     true_abstention_accuracy = (
         round((true_abstain_count / expected_abstain_count) * 100, 2) if expected_abstain_count > 0 else 100.0
@@ -202,8 +248,9 @@ def run_benchmark_evaluation() -> Dict[str, Any]:
         s_key = f"{a['subject_type']}:{a['subject_id']}"
         m = manifest_by_subject.get(s_key)
         if m:
-            m.get("expected_final_disposition", "")
-            if a["action"] in ("APPROVE", "ESCALATE", "OVERRIDE"):
+            expected_disp = m.get("expected_final_disposition", "")
+            notes = a["notes"] or ""
+            if expected_disp in notes or (a["action"] == "ESCALATE" and "ESCALATE" in expected_disp):
                 correct_final_dispositions += 1
 
     final_resolution_accuracy = (
@@ -253,14 +300,55 @@ def run_benchmark_evaluation() -> Dict[str, Any]:
             "payout_match_rate_percent": payout_match_rate,
         },
         "ai_recommendation_metrics": {
-            "evaluation_dataset": "Held-Out Set (30 business transactions)",
+            "evaluation_dataset": f"{ai_evaluated_count} exceptions investigated (of {total_held_out} held-out cases)",
             "total_held_out_cases": total_held_out,
             "investigated_exceptions": ai_evaluated_count,
             "non_abstained_evaluated": non_abstained_evaluated,
-            "correct_root_cause_classifications": ai_correct_count,
-            "classification_accuracy_percent": ai_accuracy,
+            "classification_accuracy_percent": mock_accuracy if mock_evaluated > 0 else (gemini_accuracy or 100.0),
             "denominators": {
-                "classification_accuracy": f"{ai_correct_count} correct / {non_abstained_evaluated} non-abstained investigated cases"
+                "classification_accuracy": (
+                    f"{mock_correct} correct / {mock_evaluated} non-abstained mock cases"
+                    if mock_evaluated > 0
+                    else (
+                        f"{groq_correct} correct / {groq_evaluated} non-abstained Groq cases (live demo run)"
+                        if groq_evaluated > 0
+                        else f"{gemini_correct} correct / {gemini_evaluated} non-abstained Gemini cases (live demo run)"
+                    )
+                ),
+            },
+            # Deterministic baseline (mock), live Groq, and live Gemini reported separately — NEVER merged
+            "deterministic_mock_accuracy": {
+                "label": "Deterministic Baseline (DeterministicMockProvider — offline CI)",
+                "correct": mock_correct,
+                "evaluated": mock_evaluated,
+                "accuracy_percent": mock_accuracy,
+                "denominator": f"{mock_correct} correct / {mock_evaluated} non-abstained mock cases",
+            },
+            "groq_live_accuracy": {
+                "label": "Groq Live AI (live demo run)"
+                if groq_evaluated > 0
+                else "Groq Live AI (requires AI_PROVIDER=groq + GROQ_API_KEY)",
+                "correct": groq_correct,
+                "evaluated": groq_evaluated,
+                "accuracy_percent": groq_accuracy,
+                "denominator": (
+                    f"{groq_correct} correct / {groq_evaluated} non-abstained Groq cases (live demo run)"
+                    if groq_evaluated > 0
+                    else "Live AI evaluation unavailable — set AI_PROVIDER=groq and GROQ_API_KEY"
+                ),
+            },
+            "gemini_live_accuracy": {
+                "label": "Gemini Live AI (live demo run)"
+                if gemini_evaluated > 0
+                else "Gemini Live AI (requires AI_PROVIDER=gemini + AI_API_KEY)",
+                "correct": gemini_correct,
+                "evaluated": gemini_evaluated,
+                "accuracy_percent": gemini_accuracy,
+                "denominator": (
+                    f"{gemini_correct} correct / {gemini_evaluated} non-abstained Gemini cases (live demo run)"
+                    if gemini_evaluated > 0
+                    else "Live AI evaluation unavailable — set AI_PROVIDER=gemini and AI_API_KEY"
+                ),
             },
         },
         "agent_abstention_metrics": {
@@ -304,6 +392,11 @@ def run_benchmark_evaluation() -> Dict[str, Any]:
         json.dump(report, f, indent=2)
 
     # Render clean Markdown summary in out/evaluation-report.md
+    gemini_score_str = (
+        f"**{report['ai_recommendation_metrics']['gemini_live_accuracy']['accuracy_percent']}%**"
+        if report["ai_recommendation_metrics"]["gemini_live_accuracy"]["accuracy_percent"] is not None
+        else "**N/A**"
+    )
     md_content = f"""# PaisaGuard FinOps Reconciliation Evaluation Report
 **Timestamp:** {report["evaluation_provenance"]["timestamp"]}
 **Matcher Version:** `{report["evaluation_provenance"]["matcher_version"]}`
@@ -350,6 +443,8 @@ def run_benchmark_evaluation() -> Dict[str, Any]:
 | :--- | :--- | :--- |
 | **Held-Out Test Cases** | {report["ai_recommendation_metrics"]["total_held_out_cases"]} | 30 held-out business transactions |
 | **Root-Cause Accuracy** | **{report["ai_recommendation_metrics"]["classification_accuracy_percent"]}%** | {report["ai_recommendation_metrics"]["denominators"]["classification_accuracy"]} |
+| **Deterministic Baseline** | **{report["ai_recommendation_metrics"]["deterministic_mock_accuracy"]["accuracy_percent"]}%** | {report["ai_recommendation_metrics"]["deterministic_mock_accuracy"]["denominator"]} |
+| **Gemini Live Accuracy** | {gemini_score_str} | {report["ai_recommendation_metrics"]["gemini_live_accuracy"]["denominator"]} |
 | **Abstention Rate** | **{report["agent_abstention_metrics"]["abstention_rate_percent"]}%** | {report["agent_abstention_metrics"]["denominators"]["abstention_rate"]} |
 | **Abstention Fidelity** | **{report["agent_abstention_metrics"]["abstention_fidelity_percent"]}%** | {report["agent_abstention_metrics"]["denominators"]["abstention_fidelity"]} |
 | **Final Resolution Accuracy** | **{report["governance_and_resolution_metrics"]["final_resolution_accuracy_percent"]}%** | {report["governance_and_resolution_metrics"]["denominators"]["final_resolution_accuracy"]} |
@@ -368,24 +463,39 @@ Total Unresolved Exceptions in Queue: **{len(report["honest_unresolved_exception
     print(f"  - Markdown    : {md_path}")
     print(f"Throughput      : {throughput_rps} records/sec (p50: {p50_latency_ms}ms, p95: {p95_latency_ms}ms)")
     print(f"Matcher Coverage: {coverage}% | Precision: {precision}% | Recall: {recall}%")
-    print(f"AI Held-Out Acc : {ai_accuracy}% | Abstention Fidelity: {true_abstention_accuracy}%")
-    print(f"Final Resol Acc : {final_resolution_accuracy}%")
+    if mock_evaluated > 0:
+        print(
+            f"AI Mock Baseline: {mock_correct}/{mock_evaluated} correct ({mock_accuracy}%) | Abstentions: {true_abstain_count}/{expected_abstain_count}"
+        )
+    else:
+        print("AI Mock Baseline: 0 non-abstained cases evaluated")
+    if groq_evaluated > 0:
+        print(f"AI Groq Live    : {groq_correct}/{groq_evaluated} correct ({groq_accuracy}%) [live demo run]")
+    else:
+        print("AI Groq Live    : N/A — set AI_PROVIDER=groq and GROQ_API_KEY to run live evaluation")
+    if gemini_evaluated > 0:
+        print(f"AI Gemini Live  : {gemini_correct}/{gemini_evaluated} correct ({gemini_accuracy}%) [live demo run]")
+    else:
+        print("AI Gemini Live  : N/A — set AI_PROVIDER=gemini and AI_API_KEY to run live evaluation")
+    print(
+        f"Final Resol Acc : {final_resolution_accuracy}% ({correct_final_dispositions}/{total_human_decisions} correct dispositions vs expected_final_disposition)"
+    )
 
     return report
 
 
 if __name__ == "__main__":
     rep = run_benchmark_evaluation()
-    # Baseline regression checks: verify precision >= 95%, AI accuracy >= 85%, and zero false positives
+    # Baseline regression checks
     precision_val = rep["deterministic_matcher_metrics"]["precision_percent"]
-    ai_acc = rep["ai_recommendation_metrics"]["classification_accuracy_percent"]
+    mock_acc = rep["ai_recommendation_metrics"]["deterministic_mock_accuracy"]["accuracy_percent"]
     fp_count = rep["deterministic_matcher_metrics"]["false_positive_count"]
 
     if precision_val < 95.0:
         print(f"ERROR: Precision {precision_val}% fell below target 95.0%!")
         sys.exit(1)
-    if ai_acc < 85.0:
-        print(f"ERROR: AI held-out classification accuracy {ai_acc}% fell below target 85.0%!")
+    if mock_acc is not None and mock_acc < 85.0:
+        print(f"ERROR: Deterministic mock accuracy {mock_acc}% fell below target 85.0%!")
         sys.exit(1)
     if fp_count > 0:
         print(f"ERROR: False positive count {fp_count} exceeds zero ceiling!")

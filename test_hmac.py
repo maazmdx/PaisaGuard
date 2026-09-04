@@ -205,17 +205,20 @@ def test_verification_is_stateless_and_repeatable():
 # ---------------------------------------------------------------------------
 
 
-def test_repeated_pipeline_runs_are_deterministic():
+def test_repeated_pipeline_runs_are_deterministic(tmp_path):
     """
     Running the pipeline twice with reset_accumulator=True must produce the
     same match_rate and gst_tax_leakage, proving the engine is fully
     deterministic when starting from a clean accumulator state.
     """
-    from db import DEFAULT_DB_PATH
     from recon_engine import execute_reconciliation_pipeline
+    from seed_data import seed_database
 
-    run1 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
-    run2 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
+    db_file = str(tmp_path / "recon_test.db")
+    seed_database(db_file)
+
+    run1 = execute_reconciliation_pipeline(db_file, reset_accumulator=True)
+    run2 = execute_reconciliation_pipeline(db_file, reset_accumulator=True)
 
     assert run1["match_rate"] == run2["match_rate"], (
         f"Match rate changed between identical runs: {run1['match_rate']} vs {run2['match_rate']}"
@@ -231,16 +234,19 @@ def test_repeated_pipeline_runs_are_deterministic():
 # ---------------------------------------------------------------------------
 
 
-def test_accumulator_rolls_forward_across_runs():
+def test_accumulator_rolls_forward_across_runs(tmp_path):
     """
     When reset_accumulator=False, the second run should pick up the accumulator
     from the first run, producing a non-zero (compounded) drift.
     """
-    from db import DEFAULT_DB_PATH
     from recon_engine import execute_reconciliation_pipeline
+    from seed_data import seed_database
 
-    run1 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
-    run2 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=False)
+    db_file = str(tmp_path / "recon_test_cont.db")
+    seed_database(db_file)
+
+    run1 = execute_reconciliation_pipeline(db_file, reset_accumulator=True)
+    run2 = execute_reconciliation_pipeline(db_file, reset_accumulator=False)
 
     # Both runs should complete; run_id must increment
     assert run2["run_id"] > run1["run_id"]

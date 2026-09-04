@@ -10,6 +10,10 @@ jobs:
   test-and-verify:
     runs-on: ubuntu-latest
 
+    env:
+      AI_PROVIDER: "mock"
+      PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS: "false"
+
     steps:
       - name: Checkout Codebase
         uses: actions/checkout@v4
@@ -35,9 +39,9 @@ jobs:
         run: |
           python seed_data.py --reset
 
-      - name: Execute Full Pytest Harness (39 Tests)
+      - name: Execute Full Pytest Harness
         run: |
-          pytest -v
+          pytest -q
 
       - name: Run Reconciliation Benchmark & Accuracy Evaluation
         env:
@@ -70,11 +74,13 @@ jobs:
           with open('out/evaluation-report.json') as f:
               d = json.load(f)
           p = d.get('performance_benchmarks', {})
-          a = d.get('accuracy_benchmarks', {})
-          dm = a.get('deterministic_matcher', {})
-          ai = a.get('ai_agent_evaluation', {})
-          print(f\"Throughput: {p.get('records_per_second', 0):.2f} rec/s (p50: {p.get('p50_latency_ms', 0):.2f}ms, p95: {p.get('p95_latency_ms', 0):.2f}ms)\")
-          print(f\"Matcher: Coverage={dm.get('coverage_percent')}% Precision={dm.get('precision_percent')}% Recall={dm.get('recall_percent')}%\")
-          print(f\"AI Agent: Accuracy={ai.get('held_out_accuracy_percent')}% Abstention Fidelity={ai.get('deliberate_abstention_fidelity_percent')}%\")
-          print(f\"Final Resolution Accuracy: {a.get('final_resolution_accuracy', {}).get('resolution_accuracy_percent')}%\")
+          dm = d.get('deterministic_matcher_metrics', {})
+          ai_mock = d.get('ai_recommendation_metrics', {}).get('deterministic_mock_accuracy', {})
+          abs_m = d.get('agent_abstention_metrics', {})
+          gov = d.get('governance_and_resolution_metrics', {})
+          print(f\"Throughput: {p.get('throughput_records_per_sec', 0):.2f} rec/s (p50: {p.get('latency_p50_ms', 0):.2f}ms, p95: {p.get('latency_p95_ms', 0):.2f}ms)\")
+          print(f\"Matcher: Coverage={dm.get('match_coverage_percent')}% Precision={dm.get('precision_percent')}% Recall={dm.get('recall_percent')}%\")
+          print(f\"AI Baseline (Mock): Accuracy={ai_mock.get('accuracy_percent')}% ({ai_mock.get('denominator')})\")
+          print(f\"Abstention Fidelity: {abs_m.get('abstention_fidelity_percent')}%\")
+          print(f\"Final Resolution Accuracy: {gov.get('final_resolution_accuracy_percent')}%\")
           "

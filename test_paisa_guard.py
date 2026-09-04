@@ -70,6 +70,26 @@ def setup_test_db():
 
 
 # -------------------------------------------------------------
+# 0. TestClient Smoke Test — Verifies FastAPI/Starlette/HTTPX compatibility
+# Must be the first test. A hang here means incompatible package versions are installed.
+# Fix: install the exact == pinned set from requirements.txt, not latest versions.
+# -------------------------------------------------------------
+def test_testclient_smoke_root_health():
+    """
+    Minimal TestClient sanity check. If this test hangs, the installed
+    FastAPI/Starlette/HTTPX set is incompatible. Do NOT suppress warnings —
+    resolve the package versions instead.
+    """
+    client = TestClient(app)
+    r = client.get("/")
+    assert r.status_code == 200, f"Root health check failed: {r.text}"
+    data = r.json()
+    assert data.get("status") == "operational", f"Unexpected root response: {data}"
+    assert data.get("version") == "3.0.0"
+    assert "canonical_currency" in data
+
+
+# -------------------------------------------------------------
 # 1. Canonical Integer Paise Hygiene Tests
 # -------------------------------------------------------------
 def test_integer_paise_hygiene():
@@ -266,6 +286,50 @@ def test_webhook_deduplication(setup_test_db, monkeypatch):
     count = conn.execute("SELECT COUNT(*) FROM webhook_events WHERE event_id = 'evt_unique_dedup_99'").fetchone()[0]
     conn.close()
     assert count == 1
+
+
+def test_webhook_monetary_normalization_and_defensive_fields(setup_test_db, monkeypatch):
+    """Verifies that flat webhooks with float/str rupee amounts or omitted fee/tax/event_id are safely normalized."""
+    client = TestClient(app)
+    monkeypatch.setenv("RAZORPAY_WEBHOOK_SECRET", TEST_SECRET)
+    monkeypatch.setenv("PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS", "false")
+
+    payload = {
+        "event": "payment.captured",
+        "payment_id": "pay_norm_test_777",
+        "order_id": "ord_norm_777",
+        "amount": 1500.50,  # Float rupees -> converted to 150050 paise
+        "fee": "30.00",  # Str rupees -> converted to 3000 paise
+        "tax": None,  # None -> safely defaulted to 0 paise
+        "payment_method": "upi",
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    sig = hmac.new(TEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
+    res = client.post("/webhooks/razorpay", content=raw, headers={"X-Razorpay-Signature": sig})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "ingested"
+    assert data["amount_paise"] == 150050
+    assert data["payment_id"] == "pay_norm_test_777"
+    assert data["event_id"].startswith("evt_")
+
+
+def test_api_global_exception_handler_sanitizes_500():
+    """Verifies that unhandled server exceptions return clean JSON without leaking stack traces or secrets."""
+    client = TestClient(app, raise_server_exceptions=False)
+
+    @app.get("/test-unhandled-crash")
+    def route_that_crashes():
+        raise RuntimeError("Sensitive internal database connection error: secret_internal_token_xyz")
+
+    res = client.get("/test-unhandled-crash")
+    assert res.status_code == 500
+    data = res.json()
+    assert data["error"] == "Internal Server Error"
+    assert "secret_internal_token_xyz" not in res.text
+    assert "Traceback" not in res.text
+    assert data["path"] == "/test-unhandled-crash"
 
 
 # -------------------------------------------------------------
@@ -519,3 +583,264 @@ def test_dashboard_read_endpoints(setup_test_db):
     r_prom = client.get("/metrics/prometheus")
     assert r_prom.status_code == 200
     assert "paisaguard_tx_match_rate_percent" in r_prom.text
+
+
+# -------------------------------------------------------------
+# 14. Gemini REST Request Verification & Label Isolation Unit Test
+# -------------------------------------------------------------
+def test_gemini_request_payload_and_label_isolation(setup_test_db, monkeypatch):
+    """
+    Focused unit test verifying that:
+    1. The Gemini API key is passed via 'x-goog-api-key' header, NEVER in the request URL.
+    2. generationConfig contains 'responseMimeType': 'application/json' (exact camelCase).
+    3. Timeout is set to 15.0 seconds.
+    4. Neither 'discrepancy_code' nor 'expected_root_cause' appears in the prompt or evidence bundle.
+    5. The ground-truth discrepancy label itself is stripped from Gemini evidence.
+    """
+    import requests
+
+    from exception_agent import GeminiProvider, investigate_exception
+
+    test_key = "test_gemini_secret_key_abcdef123"
+    captured_calls = []
+
+    class MockResponse:
+        status_code = 200
+        text = '{"status": "ok"}'
+
+        def json(self):
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        {
+                                            "root_cause": "CORPORATE_CARD_SURCHARGE",
+                                            "confidence": 0.94,
+                                            "evidence_record_ids": ["ord_in_1001"],
+                                            "evidence_summary": "Detected 50 bps surcharge from mathematical fee analysis.",
+                                            "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
+                                            "requires_human_approval": True,
+                                            "should_abstain": False,
+                                            "abstention_reason": None,
+                                        }
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    def mock_post(url, headers=None, json=None, timeout=None):
+        captured_calls.append(
+            {
+                "url": url,
+                "headers": headers or {},
+                "json": json or {},
+                "timeout": timeout,
+            }
+        )
+        return MockResponse()
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    provider = GeminiProvider(api_key=test_key, model_name="gemini-3.5-flash")
+
+    # Fetch a known exception decision from test database
+    conn = get_db_connection(TEST_DB_PATH)
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT decision_id, discrepancy_code FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "Need at least one exception decision in test database"
+    dec_id = row["decision_id"]
+    hidden_label = row["discrepancy_code"]
+
+    res = investigate_exception(decision_id=dec_id, db_path=TEST_DB_PATH, provider=provider)
+    assert res["root_cause"] == "CORPORATE_CARD_SURCHARGE"
+    assert res["provider_label"].startswith("Gemini/")
+
+    assert len(captured_calls) >= 1, "Expected requests.post to be called"
+    call = captured_calls[0]
+
+    # 1. API key header assertion
+    assert call["headers"].get("x-goog-api-key") == test_key, "API key must be passed via x-goog-api-key header"
+    assert "key=" not in call["url"], "API key must NOT appear in request URL"
+    assert test_key not in call["url"], "Secret key string must not leak into request URL"
+
+    # 2. generationConfig responseMimeType assertion
+    assert call["json"].get("generationConfig", {}).get("responseMimeType") == "application/json", (
+        "generationConfig must contain 'responseMimeType': 'application/json'"
+    )
+
+    # 3. Timeout assertion
+    assert call["timeout"] == 15.0, "Timeout must be 15.0 seconds"
+
+    # 4. Label isolation assertion
+    prompt_text = call["json"]["contents"][0]["parts"][0]["text"]
+    full_payload_str = json.dumps(call["json"])
+
+    assert "discrepancy_code" not in prompt_text, "'discrepancy_code' must never appear in Gemini prompt"
+    assert "expected_root_cause" not in prompt_text, "'expected_root_cause' must never appear in Gemini prompt"
+    assert "discrepancy_code" not in full_payload_str, "'discrepancy_code' must never appear in request payload"
+    assert "expected_root_cause" not in full_payload_str, "'expected_root_cause' must never appear in request payload"
+    assert hidden_label not in prompt_text, f"Ground-truth label '{hidden_label}' must be isolated from Gemini prompt"
+
+
+# -------------------------------------------------------------
+# 15. AI Preflight Verification Endpoint Test
+# -------------------------------------------------------------
+def test_ai_preflight_endpoint():
+    """Verifies that GET /ai/preflight returns mode and status without leaking secrets."""
+    client = TestClient(app)
+    r = client.get("/ai/preflight")
+    assert r.status_code == 200
+    data = r.json()
+    assert "status" in data
+    assert "mode" in data
+    assert "provider" in data
+    assert "live_ai_available" in data
+    # Guarantee no sensitive keys leaked
+    assert "api_key" not in data or data.get("api_key") is None
+    assert "x-goog-api-key" not in data
+    assert "Authorization" not in data
+
+
+# -------------------------------------------------------------
+# 16. Groq REST Request Verification & Label Isolation Unit Test
+# -------------------------------------------------------------
+def test_groq_request_payload_and_label_isolation(setup_test_db, monkeypatch):
+    """
+    Focused unit test verifying that:
+    1. The Groq API key is passed via 'Authorization: Bearer <key>' header, NEVER in URL.
+    2. Request contains response_format={'type': 'json_object'}.
+    3. Timeout is set to 15.0 seconds.
+    4. Neither 'discrepancy_code' nor 'expected_root_cause' appears in prompt or evidence.
+    5. The ground-truth discrepancy label itself is stripped from Groq evidence.
+    6. Returns provider_label starting with 'Groq/'.
+    """
+    import requests
+
+    from exception_agent import GroqProvider, investigate_exception
+
+    test_groq_key = "gsk_test_groq_secret_key_123456789"
+    captured_calls = []
+
+    class MockGroqResponse:
+        status_code = 200
+        text = '{"status": "ok"}'
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "root_cause": "CORPORATE_CARD_SURCHARGE",
+                                    "confidence": 0.95,
+                                    "evidence_record_ids": ["ord_in_1001"],
+                                    "evidence_summary": "Factual fee rate indicates corporate card commercial surcharge.",
+                                    "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
+                                    "requires_human_approval": True,
+                                    "should_abstain": False,
+                                    "abstention_reason": None,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    def mock_post(url, headers=None, json=None, timeout=None):
+        captured_calls.append(
+            {
+                "url": url,
+                "headers": headers or {},
+                "json": json or {},
+                "timeout": timeout,
+            }
+        )
+        return MockGroqResponse()
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    provider = GroqProvider(api_key=test_groq_key, model_name="llama-3.3-70b-versatile")
+
+    # Fetch a known exception decision from test database
+    conn = get_db_connection(TEST_DB_PATH)
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT decision_id, discrepancy_code FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "Need at least one exception decision in test database"
+    dec_id = row["decision_id"]
+    hidden_label = row["discrepancy_code"]
+
+    res = investigate_exception(decision_id=dec_id, db_path=TEST_DB_PATH, provider=provider)
+    assert res["root_cause"] == "CORPORATE_CARD_SURCHARGE"
+    assert res["provider_label"].startswith("Groq/")
+
+    assert len(captured_calls) >= 1, "Expected requests.post to be called"
+    call = captured_calls[0]
+
+    # 1. Auth header assertion
+    auth_header = call["headers"].get("Authorization")
+    assert auth_header == f"Bearer {test_groq_key}", "Must pass Bearer token in Authorization header"
+    assert test_groq_key not in call["url"], "Secret Groq key must never appear in request URL"
+    assert call["url"] == "https://api.groq.com/openai/v1/chat/completions"
+
+    # 2. Strict JSON format assertion
+    assert call["json"].get("response_format") == {"type": "json_object"}, (
+        "Groq payload must specify response_format={'type': 'json_object'}"
+    )
+
+    # 3. Timeout assertion
+    assert call["timeout"] == 15.0, "Timeout must be 15.0 seconds"
+
+    # 4. Label isolation assertion
+    user_message = next(m["content"] for m in call["json"]["messages"] if m["role"] == "user")
+    full_payload_str = json.dumps(call["json"])
+
+    assert "discrepancy_code" not in user_message, "'discrepancy_code' must never appear in Groq prompt"
+    assert "expected_root_cause" not in user_message, "'expected_root_cause' must never appear in Groq prompt"
+    assert "discrepancy_code" not in full_payload_str, "'discrepancy_code' must never appear in payload"
+    assert "expected_root_cause" not in full_payload_str, "'expected_root_cause' must never appear in payload"
+    assert hidden_label not in user_message, f"Ground-truth label '{hidden_label}' must be isolated from Groq prompt"
+
+
+def test_groq_preflight_check(monkeypatch):
+    """Verifies that preflight check correctly verifies Groq configuration without leaking key."""
+    import requests
+
+    from exception_agent import check_ai_preflight
+
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test_mock_key_98765")
+    monkeypatch.setenv("AI_MODEL", "llama-3.3-70b-versatile")
+
+    class MockPingResponse:
+        status_code = 200
+
+    def mock_ping(url, headers=None, json=None, timeout=None):
+        assert "Authorization" in headers
+        assert "gsk_test_mock_key_98765" in headers["Authorization"]
+        assert "gsk_test_mock_key_98765" not in url
+        return MockPingResponse()
+
+    monkeypatch.setattr(requests, "post", mock_ping)
+
+    res = check_ai_preflight()
+    assert res["status"] == "operational"
+    assert res["mode"] == "groq_live_demo"
+    assert res["provider"] == "GroqProvider"
+    assert res["api_key_configured"] is True
+    assert res["live_ai_available"] is True
+    assert "gsk_test_mock_key_98765" not in json.dumps(res)

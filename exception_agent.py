@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
 from pydantic import BaseModel, Field, ValidationError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,9 +42,52 @@ from policy_gate import ALLOWED_ACTIONS, PolicyGatekeeper
 
 logger = logging.getLogger("paisaguard.agent")
 
+
+def normalize_model_name(raw: Optional[str], provider: str = "gemini") -> str:
+    cleaned = (raw or "").strip()
+    if provider == "groq":
+        if not cleaned or cleaned.startswith("gemini-") or cleaned.startswith("models/"):
+            return "llama-3.3-70b-versatile"
+        return cleaned
+    c_lower = cleaned.lower()
+    if not cleaned or "llama" in c_lower:
+        return "gemini-3.5-flash"
+    if c_lower in ("3.5 flash", "3.5-flash", "gemini-3.5-flash", "3.5"):
+        return "gemini-3.5-flash"
+    if c_lower in ("2.5 flash", "2.5-flash", "gemini-2.5-flash", "2.5"):
+        return "gemini-2.5-flash"
+    if c_lower.startswith("models/"):
+        return cleaned.split("models/")[1]
+    if not c_lower.startswith("gemini-") and not c_lower.startswith("gemma-"):
+        return f"gemini-{cleaned.replace(' ', '-')}"
+    return cleaned or "gemini-3.5-flash"
+
+
+def _load_local_env_file(filepath: Path = BASE_DIR / ".env") -> None:
+    """Load key-value pairs from .env if it exists, without overriding existing shell environment."""
+    if not filepath.is_file():
+        return
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip("'").strip('"')
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except Exception:
+        pass
+
+
+_load_local_env_file()
+
 AI_PROVIDER_ENV = os.environ.get("AI_PROVIDER", "mock").lower()
-AI_MODEL_ENV = os.environ.get("AI_MODEL", "gemini-2.5-flash")
+GROQ_API_KEY_ENV = os.environ.get("GROQ_API_KEY", "")
 AI_API_KEY_ENV = os.environ.get("AI_API_KEY", "")
+AI_MODEL_ENV = os.environ.get("AI_MODEL", "")
 
 
 class ExceptionInvestigationResult(BaseModel):
@@ -237,43 +281,158 @@ class DeterministicMockProvider(BaseAIProvider):
 
 class GeminiProvider(BaseAIProvider):
     """
-    Live Gemini integration using Google GenAI SDK or HTTP request.
-    Fails closed if AI_API_KEY is not set. Never logs secret values.
+    Live Gemini integration via Google Generative Language REST API.
+
+    Security constraints:
+    - NEVER receives discrepancy_code, expected_root_cause, or any ground-truth label.
+    - Prompt contains only raw factual evidence: amounts, fees, record IDs, free-text reason.
+    - Model must infer root cause from financial evidence; it is never told the answer.
+    - API key is passed via 'x-goog-api-key' header and NEVER in the request URL or logs.
+    - Fails closed if AI_API_KEY is not set.
     """
 
-    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: str, model_name: str = "gemini-3.5-flash"):
         if not api_key:
             raise ValueError("FinOps Configuration Violation: AI_API_KEY must be provided when AI_PROVIDER='gemini'.")
         self.api_key = api_key
-        self.model_name = model_name
+        self.model_name = normalize_model_name(model_name)
 
     def investigate(self, prompt: str, evidence: Dict[str, Any]) -> str:
-        import requests
+        models_to_try = [self.model_name]
+        if self.model_name != "gemini-2.5-flash":
+            models_to_try.append("gemini-2.5-flash")
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"response_mime_type": "application/json"},
+            "generationConfig": {"responseMimeType": "application/json"},
         }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=12.0)
-            if resp.status_code != 200:
+        last_exc: Optional[Exception] = None
+        for attempt, current_model in enumerate(models_to_try):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent"
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=15.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                if resp.status_code >= 500 and attempt < len(models_to_try) - 1:
+                    logger.warning(
+                        f"Gemini API {resp.status_code} on model '{current_model}', "
+                        f"retrying with '{models_to_try[attempt + 1]}'..."
+                    )
+                    last_exc = RuntimeError(f"Gemini API returned status {resp.status_code}: {resp.text[:200]}")
+                    continue
                 raise RuntimeError(f"Gemini API returned status {resp.status_code}: {resp.text[:200]}")
-            data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as exc:
-            raise RuntimeError(f"Gemini API invocation failed: {exc}") from exc
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt < len(models_to_try) - 1:
+                    logger.warning(
+                        f"Gemini API network error on model '{current_model}', "
+                        f"retrying with '{models_to_try[attempt + 1]}': {exc}"
+                    )
+                    continue
+        raise RuntimeError(
+            f"Gemini API invocation failed after {len(models_to_try)} attempts: {last_exc}"
+        ) from last_exc
+
+
+class GroqProvider(BaseAIProvider):
+    """
+    Live Groq integration via Groq OpenAI-compatible REST API.
+    Endpoint: https://api.groq.com/openai/v1/chat/completions
+
+    Security constraints:
+    - NEVER receives discrepancy_code, expected_root_cause, or any ground-truth label.
+    - Prompt contains only raw factual evidence: amounts, fees, record IDs, free-text reason.
+    - Model must infer root cause from financial evidence; it is never told the answer.
+    - API key is passed via 'Authorization: Bearer <token>' header and NEVER in URL or logs.
+    - Request strict JSON output matching ExceptionInvestigationResult using response_format={'type': 'json_object'}.
+    - Fails closed if GROQ_API_KEY is not set.
+    """
+
+    def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile"):
+        if not api_key:
+            raise ValueError("FinOps Configuration Violation: GROQ_API_KEY must be provided when AI_PROVIDER='groq'.")
+        self.api_key = api_key
+        self.model_name = normalize_model_name(model_name, provider="groq")
+
+    def investigate(self, prompt: str, evidence: Dict[str, Any]) -> str:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert FinOps Exception Investigation Agent for PaisaGuard.\n"
+                        "Analyze the provided factual financial evidence and output a strict JSON object.\n"
+                        "You must infer root cause from the numbers and evidence. Never guess or hallucinate IDs."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+        }
+
+        models_to_try = [self.model_name]
+        for fallback in ["llama-3.3-70b-versatile", "groq/compound", "groq/compound-mini"]:
+            if fallback not in models_to_try:
+                models_to_try.append(fallback)
+
+        last_exc: Optional[Exception] = None
+        for attempt, current_model in enumerate(models_to_try):
+            payload["model"] = current_model
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=15.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self.model_name = current_model
+                    return data["choices"][0]["message"]["content"]
+                if (resp.status_code >= 500 or resp.status_code == 404) and attempt < len(models_to_try) - 1:
+                    logger.warning(
+                        f"Groq API {resp.status_code} on model '{current_model}', "
+                        f"retrying with '{models_to_try[attempt + 1]}'..."
+                    )
+                    last_exc = RuntimeError(f"Groq API returned status {resp.status_code}: {resp.text[:200]}")
+                    continue
+                raise RuntimeError(f"Groq API returned status {resp.status_code}: {resp.text[:200]}")
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt < len(models_to_try) - 1:
+                    logger.warning(
+                        f"Groq API network error on model '{current_model}', "
+                        f"retrying with '{models_to_try[attempt + 1]}': {exc}"
+                    )
+                    continue
+        raise RuntimeError(f"Groq API invocation failed after {len(models_to_try)} attempts: {last_exc}") from last_exc
 
 
 def get_ai_provider() -> BaseAIProvider:
     """Instantiates the configured AI provider, failing closed on misconfiguration."""
     provider_name = os.environ.get("AI_PROVIDER", AI_PROVIDER_ENV).lower()
+    if provider_name == "groq":
+        api_key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY_ENV).strip()
+        if not api_key:
+            raise RuntimeError("CRITICAL ERROR: AI_PROVIDER='groq' configured but GROQ_API_KEY is unset.")
+        raw_model = os.environ.get("AI_MODEL", AI_MODEL_ENV) or "llama-3.3-70b-versatile"
+        return GroqProvider(api_key=api_key, model_name=normalize_model_name(raw_model, provider="groq"))
     if provider_name == "gemini":
-        api_key = os.environ.get("AI_API_KEY", AI_API_KEY_ENV)
+        api_key = os.environ.get("AI_API_KEY", AI_API_KEY_ENV).strip()
         if not api_key:
             raise RuntimeError("CRITICAL ERROR: AI_PROVIDER='gemini' configured but AI_API_KEY is unset.")
-        return GeminiProvider(api_key=api_key, model_name=os.environ.get("AI_MODEL", AI_MODEL_ENV))
+        raw_model = os.environ.get("AI_MODEL", AI_MODEL_ENV) or "gemini-3.5-flash"
+        return GeminiProvider(api_key=api_key, model_name=normalize_model_name(raw_model, provider="gemini"))
     return DeterministicMockProvider()
 
 
@@ -325,46 +484,93 @@ def investigate_exception(
         valid_ids.append(str(evidence_dict["credit_id"]))
     valid_ids = sorted(list(set(valid_ids)))
 
-    # Construct minimized evidence bundle (strictly factual, zero ground truth labels)
-    minimized_evidence = {
+    # ----------------------------------------------------------------
+    # Evidence Bundle Construction
+    # Two separate dicts with strict data isolation:
+    #
+    # internal_evidence: includes discrepancy_code for DeterministicMockProvider's
+    #   rule-based logic. The mock is a reproducible offline baseline, not an AI
+    #   under evaluation, so label access is permissible and expected.
+    #
+    # gemini_evidence: STRICTLY factual only. No discrepancy_code, no labels,
+    #   no expected_root_cause. Gemini must infer root cause from raw financial
+    #   evidence alone. Violating this corrupts the evaluation.
+    # ----------------------------------------------------------------
+    gross_amount_paise = evidence_dict.get("amount_paise", evidence_dict.get("oms_amount_paise", 0))
+    actual_fee_paise = evidence_dict.get("actual_fee_paise", evidence_dict.get("fee_paise", 0))
+    raw_reason = evidence_dict.get("reason", "")
+
+    internal_evidence = {
         "decision_id": decision_id,
         "subject_type": row["subject_type"],
         "subject_id": row["subject_id"],
-        "discrepancy_code": discrepancy_code,
+        "discrepancy_code": discrepancy_code,  # label — mock only, never sent to Gemini
         "variance_paise": variance_paise,
-        "gross_amount_paise": evidence_dict.get("amount_paise", evidence_dict.get("oms_amount_paise", 0)),
-        "actual_fee_paise": evidence_dict.get("actual_fee_paise", evidence_dict.get("fee_paise", 0)),
-        "reason": evidence_dict.get("reason", ""),
+        "gross_amount_paise": gross_amount_paise,
+        "actual_fee_paise": actual_fee_paise,
+        "reason": raw_reason,
         "available_record_ids": valid_ids,
     }
 
-    evidence_bundle_bytes = json.dumps(minimized_evidence, sort_keys=True).encode("utf-8")
+    # Factual-only evidence bundle: no classification labels whatsoever
+    gemini_evidence = {
+        "decision_id": decision_id,
+        "subject_type": row["subject_type"],
+        "subject_id": row["subject_id"],
+        "variance_paise": variance_paise,
+        "gross_amount_paise": gross_amount_paise,
+        "actual_fee_paise": actual_fee_paise,
+        "raw_reason_text": raw_reason,  # free-text from gateway, no label decoding
+        "available_record_ids": valid_ids,
+    }
+
+    # Hash is computed over internal_evidence for audit provenance (stable across providers)
+    evidence_bundle_bytes = json.dumps(internal_evidence, sort_keys=True).encode("utf-8")
     evidence_bundle_hash = f"sha256:{hashlib.sha256(evidence_bundle_bytes).hexdigest()}"
 
     active_provider = provider if provider else get_ai_provider()
     provider_name = active_provider.__class__.__name__
-    model_name = os.environ.get("AI_MODEL", AI_MODEL_ENV)
+    model_name = getattr(active_provider, "model_name", os.environ.get("AI_MODEL", AI_MODEL_ENV))
 
-    prompt = f"""
-You are PaisaGuard AI Finance Controller. Analyze this reconciliation exception:
-EVIDENCE BUNDLE:
-{json.dumps(minimized_evidence, indent=2)}
+    is_gemini = isinstance(active_provider, GeminiProvider)
+    is_groq = isinstance(active_provider, GroqProvider)
+    is_live_llm = is_gemini or is_groq
 
-Return strict JSON with fields:
-- root_cause (string)
-- confidence (float 0.0 to 1.0)
-- evidence_record_ids (array of cited IDs from available_record_ids)
-- evidence_summary (string)
-- proposed_action (string from ALLOWED_ACTIONS: {sorted(list(ALLOWED_ACTIONS))})
-- requires_human_approval (boolean: true)
-- should_abstain (boolean)
-- abstention_reason (string or null)
+    if is_live_llm:
+        # Live LLM prompt: factual evidence only, model must infer root cause
+        # Model NEVER receives discrepancy_code, expected_root_cause, or any ground-truth label
+        prompt = f"""You are a FinOps investigator reviewing a payment reconciliation exception.
+
+Your task: analyze the financial evidence below and infer the most likely root cause.
+Do NOT guess based on field names. Reason from the numbers.
+
+FACTUAL EVIDENCE:
+{json.dumps(gemini_evidence, indent=2)}
+
+REQUIRED RESPONSE FORMAT (strict JSON, no prose):
+{{
+  "root_cause": "<your inferred classification>",
+  "confidence": <float 0.0 to 1.0>,
+  "evidence_record_ids": [<cited IDs from available_record_ids only>],
+  "evidence_summary": "<factual mathematical summary of your reasoning>",
+  "proposed_action": "<one of: {sorted(list(ALLOWED_ACTIONS))}>",
+  "requires_human_approval": true,
+  "should_abstain": <true if insufficient evidence or confidence < 0.70>,
+  "abstention_reason": "<reason or null>"
+}}
+
+If evidence is ambiguous or contradictory, set should_abstain=true and proposed_action=\"ABSTAIN\".
 """
+        provider_evidence = gemini_evidence
+    else:
+        # Mock provider receives internal evidence including discrepancy_code for deterministic logic
+        prompt = f"""[DeterministicMockProvider] Analyze reconciliation exception:\n{json.dumps(internal_evidence, indent=2)}"""
+        provider_evidence = internal_evidence
 
     # Invoke provider with error and timeout handling
     raw_response = ""
     try:
-        raw_response = active_provider.investigate(prompt, minimized_evidence)
+        raw_response = active_provider.investigate(prompt, provider_evidence)
         parsed_data = json.loads(raw_response)
         result = ExceptionInvestigationResult(**parsed_data)
 
@@ -474,10 +680,21 @@ Return strict JSON with fields:
 
     conn.close()
 
+    # provider_label distinguishes deterministic baseline from live AI runs
+    # Used in the Streamlit UI badge and evaluation report to never conflate the two.
+    active_model = getattr(active_provider, "model_name", model_name)
+    if is_groq:
+        provider_label = f"Groq/{active_model}"
+    elif is_gemini:
+        provider_label = f"Gemini/{active_model}"
+    else:
+        provider_label = "DeterministicMock"
+
     return {
         "investigation_id": investigation_id,
         "decision_id": decision_id,
         "evidence_bundle_hash": evidence_bundle_hash,
+        "provider_label": provider_label,
         "root_cause": result.root_cause,
         "confidence": result.confidence,
         "evidence_record_ids": result.evidence_record_ids,
@@ -490,3 +707,172 @@ Return strict JSON with fields:
         "policy_reason": policy_reason,
         "created_at": timestamp,
     }
+
+
+def check_ai_preflight() -> Dict[str, Any]:
+    """
+    Verifies AI provider configuration safely without exposing any secret API keys.
+    Clearly reports whether the app is in Mock baseline mode, Gemini live-demo mode, or Groq live-demo mode.
+    """
+    import requests
+
+    provider_name = os.environ.get("AI_PROVIDER", AI_PROVIDER_ENV).lower()
+    raw_model = os.environ.get("AI_MODEL", AI_MODEL_ENV)
+
+    if provider_name == "groq":
+        groq_api_key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY_ENV).strip()
+        model_name = normalize_model_name(raw_model, provider="groq")
+        if not groq_api_key:
+            return {
+                "status": "misconfigured",
+                "mode": "groq_live_demo",
+                "provider": "GroqProvider",
+                "model": model_name,
+                "api_key_configured": False,
+                "live_ai_available": False,
+                "message": "AI_PROVIDER is set to 'groq' but GROQ_API_KEY is not configured.",
+            }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {groq_api_key}",
+        }
+        payload = {
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 5,
+        }
+        models_to_check = [model_name]
+        for fallback in ["llama-3.3-70b-versatile", "groq/compound", "groq/compound-mini"]:
+            if fallback not in models_to_check:
+                models_to_check.append(fallback)
+
+        verified_model = None
+        last_error = None
+        for m in models_to_check:
+            payload["model"] = m
+            try:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=8.0
+                )
+                if r.status_code == 200:
+                    verified_model = m
+                    break
+                else:
+                    last_error = f"HTTP {r.status_code}: {r.text[:120]}"
+            except Exception as e:
+                last_error = str(e)[:120]
+
+        if verified_model:
+            return {
+                "status": "operational",
+                "mode": "groq_live_demo",
+                "provider": "GroqProvider",
+                "model": verified_model,
+                "requested_model": model_name,
+                "api_key_configured": True,
+                "live_ai_available": True,
+                "message": f"Groq live-demo mode verified ({verified_model} responsive).",
+            }
+        else:
+            return {
+                "status": "degraded",
+                "mode": "groq_live_demo",
+                "provider": "GroqProvider",
+                "model": model_name,
+                "api_key_configured": True,
+                "live_ai_available": False,
+                "error": last_error,
+                "message": f"Groq live-demo key configured but API ping failed: {last_error}",
+            }
+
+    elif provider_name == "gemini":
+        gemini_api_key = os.environ.get("AI_API_KEY", AI_API_KEY_ENV).strip()
+        model_name = normalize_model_name(raw_model, provider="gemini")
+        if not gemini_api_key:
+            return {
+                "status": "misconfigured",
+                "mode": "gemini_live_demo",
+                "provider": "GeminiProvider",
+                "model": model_name,
+                "api_key_configured": False,
+                "live_ai_available": False,
+                "message": "AI_PROVIDER is set to 'gemini' but AI_API_KEY is not configured.",
+            }
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": gemini_api_key,
+        }
+        payload = {
+            "contents": [{"parts": [{"text": '{"status": "ping"}'}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        models_to_check = [model_name]
+        if model_name != "gemini-2.5-flash":
+            models_to_check.append("gemini-2.5-flash")
+
+        verified_model = None
+        last_error = None
+        for m in models_to_check:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=8.0)
+                if r.status_code == 200:
+                    verified_model = m
+                    break
+                else:
+                    last_error = f"HTTP {r.status_code}: {r.text[:120]}"
+            except Exception as e:
+                last_error = str(e)[:120]
+
+        if verified_model:
+            return {
+                "status": "operational",
+                "mode": "gemini_live_demo",
+                "provider": "GeminiProvider",
+                "model": verified_model,
+                "requested_model": model_name,
+                "api_key_configured": True,
+                "live_ai_available": True,
+                "message": f"Gemini live-demo mode verified ({verified_model} responsive).",
+            }
+        else:
+            return {
+                "status": "degraded",
+                "mode": "gemini_live_demo",
+                "provider": "GeminiProvider",
+                "model": model_name,
+                "api_key_configured": True,
+                "live_ai_available": False,
+                "error": last_error,
+                "message": f"Gemini live-demo key configured but API ping failed: {last_error}",
+            }
+    else:
+        groq_api_key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY_ENV).strip()
+        gemini_api_key = os.environ.get("AI_API_KEY", AI_API_KEY_ENV).strip()
+        return {
+            "status": "operational",
+            "mode": "mock_baseline",
+            "provider": "DeterministicMockProvider",
+            "model": "offline_deterministic_rules",
+            "api_key_configured": bool(gemini_api_key or groq_api_key),
+            "live_ai_available": False,
+            "message": "Mock baseline mode (offline CI & deterministic evaluation). Set AI_PROVIDER=groq or AI_PROVIDER=gemini for live reasoning.",
+        }
+
+
+if __name__ == "__main__":
+    if "--preflight" in sys.argv:
+        res = check_ai_preflight()
+        print("\n=== PaisaGuard AI Preflight Check ===")
+        print(f"Status             : {res['status'].upper()}")
+        print(f"Operational Mode   : {res['mode'].replace('_', ' ').title()}")
+        print(f"Active Provider    : {res['provider']}")
+        print(f"Model              : {res.get('model', 'N/A')}")
+        print(f"API Key Configured : {'YES' if res['api_key_configured'] else 'NO'}")
+        print(f"Live AI Available  : {'YES' if res['live_ai_available'] else 'NO'}")
+        print(f"Summary            : {res['message']}")
+        print("=====================================\n")
+        if res["status"] == "misconfigured":
+            sys.exit(1)
+        sys.exit(0)

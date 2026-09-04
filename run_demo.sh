@@ -40,16 +40,78 @@ else
     pip install -q -r requirements.txt
 fi
 
-# Configure local demo token if unset
-export PAISAGUARD_API_TOKEN="${PAISAGUARD_API_TOKEN:-pg_token_buildathon_demo_2026}"
-echo -e "-> PaisaGuard API Security Token: [CONFIGURED]"
+# -------------------------------------------------------------
+# Load local .env when it exists (shell environment takes precedence)
+# -------------------------------------------------------------
+if [ -f .env ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [[ "$trimmed" =~ ^#.*$ ]] && continue
+        [ -z "$trimmed" ] && continue
+        if [[ "$trimmed" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            var_name="${BASH_REMATCH[1]}"
+            var_val="${BASH_REMATCH[2]}"
+            var_val="${var_val%\"}"
+            var_val="${var_val#\"}"
+            var_val="${var_val%\'}"
+            var_val="${var_val#\'}"
+            if [ -z "${!var_name+x}" ]; then
+                export "$var_name"="$var_val"
+            fi
+        fi
+    done < .env
+fi
+
+# Fallback defaults for demo
+export PAISAGUARD_API_TOKEN="${PAISAGUARD_API_TOKEN:-test_finops_token_2026}"
+export RAZORPAY_WEBHOOK_SECRET="${RAZORPAY_WEBHOOK_SECRET:-rzp_sec_buildathon_2026_demo}"
+export AI_PROVIDER="${AI_PROVIDER:-mock}"
+
+# Fail-closed validation if live provider chosen without API key
+if [ "$AI_PROVIDER" = "groq" ] && [ -z "${GROQ_API_KEY:-}" ]; then
+    echo -e "${RED}Error: AI_PROVIDER is set to 'groq' but GROQ_API_KEY is not configured.${NC}"
+    echo -e "${RED}Please set GROQ_API_KEY in your .env file or export it in your shell environment.${NC}"
+    exit 1
+fi
+
+if [ "$AI_PROVIDER" = "gemini" ] && [ -z "${AI_API_KEY:-}" ]; then
+    echo -e "${RED}Error: AI_PROVIDER is set to 'gemini' but AI_API_KEY is not configured.${NC}"
+    echo -e "${RED}Please set AI_API_KEY in your .env file or export it in your shell environment.${NC}"
+    exit 1
+fi
 
 echo -e "\n[3/5] Generating synthetic 3-source dataset & seeding SQLite (WAL Mode)..."
 python3 seed_data.py --reset
 
 echo -e "\n[4/5] Executing automated verification test suite & benchmarks..."
-pytest -q
-python3 eval_benchmarks.py
+# CI and unit tests run against mock provider for deterministic reproducible assertions
+AI_PROVIDER=mock pytest -q
+AI_PROVIDER=mock python3 eval_benchmarks.py
+
+echo -e "\n=== PaisaGuard Runtime Configuration ==="
+echo -e "-> API Token          : [CONFIGURED]"
+echo -e "-> Webhook Secret     : [CONFIGURED]"
+echo -e "-> AI Provider        : ${AI_PROVIDER}"
+if [ "$AI_PROVIDER" = "groq" ]; then
+    echo -e "-> Groq API Key       : [CONFIGURED]"
+    groq_model="${AI_MODEL:-llama-3.3-70b-versatile}"
+    if [[ "$groq_model" == gemini* ]]; then groq_model="llama-3.3-70b-versatile"; fi
+    echo -e "-> Groq Model         : ${groq_model}"
+elif [ -n "${GROQ_API_KEY:-}" ]; then
+    echo -e "-> Groq API Key       : [CONFIGURED]"
+fi
+if [ "$AI_PROVIDER" = "gemini" ]; then
+    echo -e "-> Gemini API Key     : [CONFIGURED]"
+    gemini_model="${AI_MODEL:-gemini-3.5-flash}"
+    if [[ "$gemini_model" == llama* ]]; then gemini_model="gemini-3.5-flash"; fi
+    echo -e "-> Gemini Model       : ${gemini_model}"
+elif [ -n "${AI_API_KEY:-}" ]; then
+    echo -e "-> Gemini API Key     : [CONFIGURED]"
+fi
+if [ "$AI_PROVIDER" = "mock" ]; then
+    echo -e "-> Operational Mode   : Deterministic Mock Baseline (offline CI)"
+fi
+echo -e "========================================"
 
 echo -e "\n[5/5] Booting background payment gateway services..."
 
@@ -115,20 +177,39 @@ done
 
 # Replay simulated webhooks to prove real-time ingestion (Hex & Base64 with canonical integer paise)
 echo -e "-> Replaying sample signed webhook payload (Hex HMAC)..."
-PAYLOAD_HEX='{"event":"payment.captured","payment_id":"pay_demo_signed_hex","order_id":"ord_in_1001","amount_paise":150000,"currency":"INR","status":"captured"}'
-SIG_HEX=$(python3 -c "import hmac, hashlib; print(hmac.new(b'rzp_sec_buildathon_2026_demo', b'$PAYLOAD_HEX', hashlib.sha256).hexdigest())")
-curl -s -X POST http://127.0.0.1:8001/webhooks/razorpay \
+PAYLOAD_HEX='{"event_id":"evt_demo_hex_001","event":"payment.captured","payment_id":"pay_demo_signed_hex","order_id":"ord_in_1001","amount_paise":150000,"currency":"INR","status":"captured"}'
+# Compute HMAC in subshell; secret is never echoed or logged
+SIG_HEX=$(python3 -c "import hmac,hashlib,os; s=os.environ['RAZORPAY_WEBHOOK_SECRET']; print(hmac.new(s.encode(),b'''${PAYLOAD_HEX}''',hashlib.sha256).hexdigest())")
+RESP1=$(curl -sf -X POST http://127.0.0.1:8001/webhooks/razorpay \
      -H "Content-Type: application/json" \
      -H "X-Razorpay-Signature: $SIG_HEX" \
-     -d "$PAYLOAD_HEX" > /dev/null || true
+     -d "$PAYLOAD_HEX")
+if echo "$RESP1" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('status') in ('ingested','duplicate_ignored')" 2>/dev/null; then
+    echo -e "-> ${GREEN}✓ Webhook 1 (Hex HMAC) ingested successfully.${NC}"
+else
+    echo -e "${RED}Error: Webhook 1 ingestion failed. Response: $RESP1${NC}"
+    exit 1
+fi
 
 echo -e "-> Replaying sample signed webhook payload (Base64 HMAC)..."
-PAYLOAD_B64='{"event":"payment.captured","payment_id":"pay_demo_signed_b64","order_id":"ord_in_1002","amount_paise":245000,"fee_paise":4900,"tax_paise":882,"payment_method":"card"}'
-SIG_B64=$(python3 -c "import hmac, hashlib, base64; d=hmac.new(b'rzp_sec_buildathon_2026_demo', b'$PAYLOAD_B64', hashlib.sha256).digest(); print(base64.b64encode(d).decode())")
-curl -s -X POST http://127.0.0.1:8001/webhooks/razorpay \
+PAYLOAD_B64='{"event_id":"evt_demo_b64_001","event":"payment.captured","payment_id":"pay_demo_signed_b64","order_id":"ord_in_1002","amount_paise":245000,"fee_paise":4900,"tax_paise":882,"payment_method":"card"}'
+SIG_B64=$(python3 -c "import hmac,hashlib,base64,os; s=os.environ['RAZORPAY_WEBHOOK_SECRET']; d=hmac.new(s.encode(),b'''${PAYLOAD_B64}''',hashlib.sha256).digest(); print(base64.b64encode(d).decode())")
+RESP2=$(curl -sf -X POST http://127.0.0.1:8001/webhooks/razorpay \
      -H "Content-Type: application/json" \
      -H "X-Razorpay-Signature: $SIG_B64" \
-     -d "$PAYLOAD_B64" > /dev/null || true
+     -d "$PAYLOAD_B64")
+if echo "$RESP2" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('status') in ('ingested','duplicate_ignored')" 2>/dev/null; then
+    echo -e "-> ${GREEN}✓ Webhook 2 (Base64 HMAC) ingested successfully.${NC}"
+else
+    echo -e "${RED}Error: Webhook 2 ingestion failed. Response: $RESP2${NC}"
+    exit 1
+fi
+
+if [ "${1:-}" = "--exit-after-webhooks" ] || [ "${PAISAGUARD_DEMO_EXIT_AFTER_WEBHOOKS:-}" = "1" ]; then
+    echo -e "\n-> Signed webhook demonstration passed; exiting demo cleanly."
+    exit 0
+fi
+
 
 # Run Streamlit visual operator dashboard
 echo -e "-> Launching Streamlit Operator Dashboard on port 8501 (${BIND_HOST})..."

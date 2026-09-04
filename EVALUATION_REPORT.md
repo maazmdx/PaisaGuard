@@ -5,7 +5,11 @@
 **Status**: Production Verified  
 **Canonical Monetary Unit**: Integer Paise (`*_paise`, zero float calculations)  
 **Evaluation Harness**: `eval_benchmarks.py`  
+<<<<<<< ours
 **Test Suite**: 39 Automated Unit & Integration Tests (`pytest -v`)  
+=======
+**Test Suite**: 40 Automated Unit & Integration Tests (`pytest -q`)
+>>>>>>> theirs
 
 ---
 
@@ -20,17 +24,31 @@ All deterministic calculations, accounting ledgers, and database storage operate
 
 | Dimension | Metric | Measured Result | Benchmark Target | Verdict |
 | :--- | :--- | :--- | :--- | :--- |
+<<<<<<< ours
 | **System Throughput** | Records Reconciled / Sec | **2,642.71 rec/s** | $\ge 1,000\text{ rec/s}$ | 🟢 **PASS (+164%)** |
 | **Sweep Latency (p50)** | Median Execution Time | **78.85 ms** | $\le 150.0\text{ ms}$ | 🟢 **PASS** |
 | **Sweep Latency (p95)** | 95th Percentile Execution | **116.85 ms** | $\le 250.0\text{ ms}$ | 🟢 **PASS** |
+=======
+| **System Throughput** | Records Reconciled / Sec | **3,707.34 rec/s** | $\ge 1,000\text{ rec/s}$ | 🟢 **PASS (+270%)** |
+| **Sweep Latency (p50)** | Median Execution Time | **64.35 ms** | $\le 150.0\text{ ms}$ | 🟢 **PASS** |
+| **Sweep Latency (p95)** | 95th Percentile Execution | **118.65 ms** | $\le 250.0\text{ ms}$ | 🟢 **PASS** |
+>>>>>>> theirs
 | **Deterministic Coverage**| Automated 3-Way Match | **88.0%** (88/100 txns) | $\ge 85.0\%$ | 🟢 **PASS** |
 | **Matcher Precision** | Correct Matches / Total Matches | **100.0%** (88/88) | $100.0\%$ | 🟢 **PASS (0 FP)** |
 | **Matcher Recall** | Matched / Expected Matched | **100.0%** (88/88) | $100.0\%$ | 🟢 **PASS** |
 | **False Positive Rate** | Erroneously Matched Records | **0 records (0.0%)** | $0$ records | 🟢 **PASS** |
+<<<<<<< ours
 | **AI Held-Out Accuracy** | Correct Root-Cause Diagnosis | **100.0%** (30/30) | $\ge 90.0\%$ | 🟢 **PASS** |
 | **Abstention Fidelity** | Deliberate Abstentions Honored| **100.0%** (10/10) | $100.0\%$ | 🟢 **PASS (0 Hallucination)** |
 | **Citation Verification**| Validated Source Record IDs | **100.0%** valid | $100.0\%$ | 🟢 **PASS** |
 | **Final Resolution Acc** | Correct Human Dispositions | **100.0%** | $\ge 95.0\%$ | 🟢 **PASS** |
+=======
+| **AI Held-Out Accuracy (Mock)** | Correct Root-Cause Diagnosis (Offline Baseline) | **100.0%** (14/14 non-abstained) | $\ge 90.0\%$ | 🟢 **PASS** |
+| **Abstention Fidelity (Mock)** | Deliberate Abstentions Honored | **100.0%** (3/3 ambiguous cases) | $100.0\%$ | 🟢 **PASS (0 Hallucination)** |
+| **Gemini Live Accuracy** | Live Reasoning via Gemini API | **Set AI_PROVIDER=gemini** | Requires Key | ⚪ **LIVE DEMO AVAILABLE** |
+| **Citation Verification**| Validated Source Record IDs | **100.0%** valid | $100.0\%$ | 🟢 **PASS** |
+| **Final Resolution Acc** | Correct Human Dispositions | **100.0%** (17/17) | $\ge 95.0\%$ | 🟢 **PASS** |
+>>>>>>> theirs
 | **Database Concurrency** | SQLite Lock Errors | **0 locks (100% WAL)** | $0$ locks | 🟢 **PASS** |
 
 ---
@@ -44,8 +62,13 @@ The benchmarks were executed on an isolated Linux runner with SQLite Write-Ahead
 - **Total System RAM**: 16.0 GB
 - **Python Runtime**: Python 3.12.3 (`CPython`)
 - **Database Engine**: SQLite 3.45+ in WAL Mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`)
+<<<<<<< ours
 - **Web Gateway**: FastAPI 0.115+ on Uvicorn ASGI
 - **Data Serialization**: Pydantic v2.10+ (Strict type enforcement, zero floats)
+=======
+- **Web Gateway**: FastAPI 0.115.12 on Uvicorn ASGI
+- **Data Serialization**: Pydantic v2.13+ (Strict type enforcement, zero floats)
+>>>>>>> theirs
 
 ---
 
@@ -68,6 +91,7 @@ To prevent data contamination and ensure authentic, verifiable metrics:
 
 ### 3.2 Held-Out Evaluation Dataset (30 Business Transactions)
 Stored in `fixtures/ground_truth_manifest.json` under `held_out_evaluation_transactions`. **Never exposed** to the AI evidence bundle during operational runs:
+<<<<<<< ours
 - **10 Commercial Card Surcharges**: Known root-cause pattern eligible for automated adjustment recommendation.
 - **10 Ambiguous Unmapped Deductions**: Random fee variances ($>3.50\%$ MDR cap or unknown deduction codes) where the model **must deliberately abstain**.
 - **10 Delayed Bank Payout Credits**: Pending bank deposits requiring bank trace requests.
@@ -79,6 +103,24 @@ Stored in `fixtures/ground_truth_manifest.json` under `held_out_evaluation_trans
 - **AI Accuracy**: $\frac{\text{Correct Diagnoses on Held-Out Actions}}{\text{Total Held-Out Evaluated}}$
 - **Deliberate Abstention Fidelity**: $\frac{\text{Actual Abstentions on Ambiguous Cases}}{\text{Expected Abstentions (10)}}$
 - **Final Resolution Accuracy**: $\frac{\text{Correct Final Dispositions}}{\text{Decisions with a Human Final Disposition}}$
+=======
+- **13 Clean Transactions**: Matched directly by deterministic engine.
+- **17 Genuine Exception Transactions**: Queued for AI root-cause investigation:
+  - **5 Commercial Card Surcharges**: 2.50% corporate card fee (250 bps vs 200 bps baseline).
+  - **3 Unsettled OMS Orders**: Orders captured internally awaiting gateway settlement cycle.
+  - **3 Orphan Gateway Settlements**: Settlements present without matching OMS orders.
+  - **3 Partial Refund Variances**: Settled net amount differs from gross order.
+  - **3 Genuine Ambiguity / Insufficient Data**: Unmapped, conflicting data where AI **must deliberately abstain**.
+
+### 3.3 Metric Definitions
+- **Coverage**: $\frac{\text{Matched Business Transactions}}{\text{Total Operational Transactions}} = \frac{88}{100} = 88.0\%$
+- **Precision**: $\frac{TP}{TP + FP} = \frac{88}{88 + 0} = 100.0\%$
+- **Recall**: $\frac{TP}{TP + FN} = \frac{88}{88 + 0} = 100.0\%$
+- **Deterministic Mock Accuracy**: $\frac{\text{Correct Diagnoses on Non-Abstained Held-Out Exceptions}}{\text{Total Non-Abstained Exceptions Evaluated}} = \frac{14}{14} = 100.0\%$
+- **Live AI Accuracy (Groq / Gemini)**: Evaluated separately only when `AI_PROVIDER=groq` (with `GROQ_API_KEY`) or `AI_PROVIDER=gemini` (with `AI_API_KEY`) are provided. Labeled as "[live demo run]" and never conflated with the offline mock baseline.
+- **Deliberate Abstention Fidelity**: $\frac{\text{Actual Abstentions on Ambiguous Cases}}{\text{Expected Deliberate Abstentions (3)}} = \frac{3}{3} = 100.0\%$
+- **Final Resolution Accuracy**: $\frac{\text{Correct Human Dispositions Matching Ground Truth}}{\text{Decisions with Human Disposition}} = \frac{17}{17} = 100.0\%$
+>>>>>>> theirs
 
 ---
 

@@ -38,7 +38,7 @@ def simulate_webhook_flood(
             event_id TEXT PRIMARY KEY,
             order_id TEXT,
             payment_id TEXT,
-            amount REAL,
+            amount_paise INTEGER,
             status TEXT,
             received_at TEXT
         );
@@ -71,8 +71,8 @@ def simulate_webhook_flood(
 
             cursor.execute(
                 """
-                INSERT INTO webhook_events (event_id, order_id, payment_id, amount, status, received_at)
-                VALUES (?, ?, ?, 1500.00, 'captured', datetime('now'))
+                INSERT INTO webhook_events (event_id, order_id, payment_id, amount_paise, status, received_at)
+                VALUES (?, ?, ?, 150000, 'captured', datetime('now'))
                 ON CONFLICT(event_id) DO UPDATE SET
                     status = 'captured',
                     received_at = datetime('now');

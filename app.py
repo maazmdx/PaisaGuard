@@ -516,23 +516,57 @@ with tab_exceptions:
             # Display agent results if available
             inv_result = st.session_state.get(f"last_inv_{dec_id}")
             if inv_result:
+                # --- Provider Badge: 3 states ---
+                provider_label = inv_result.get("provider_label", "")
+                if "Groq" in provider_label:
+                    model_part = provider_label.split("Groq/", 1)[1] if "Groq/" in provider_label else provider_label
+                    badge_html = (
+                        f'<span style="background:#10b981;color:#fff;font-weight:700;font-size:0.75rem;'
+                        f'padding:3px 10px;border-radius:20px;letter-spacing:0.5px;">⚡ GROQ LIVE — {model_part}</span>'
+                    )
+                elif "Gemini" in provider_label:
+                    badge_html = (
+                        f'<span style="background:#10b981;color:#fff;font-weight:700;font-size:0.75rem;'
+                        f'padding:3px 10px;border-radius:20px;letter-spacing:0.5px;">🤖 GEMINI LIVE — {provider_label}</span>'
+                    )
+                elif provider_label == "DeterministicMock":
+                    badge_html = (
+                        '<span style="background:#f59e0b;color:#000;font-weight:700;font-size:0.75rem;'
+                        'padding:3px 10px;border-radius:20px;letter-spacing:0.5px;" '
+                        'title="Offline deterministic baseline — set AI_PROVIDER=groq or AI_PROVIDER=gemini for live LLM reasoning">'
+                        "⚙️ DETERMINISTIC BASELINE (Offline CI)</span>"
+                    )
+                else:
+                    badge_html = (
+                        '<span style="background:#475569;color:#fff;font-weight:700;font-size:0.75rem;'
+                        'padding:3px 10px;border-radius:20px;">⚠️ LIVE AI EVALUATION UNAVAILABLE</span>'
+                    )
+                st.markdown(badge_html, unsafe_allow_html=True)
+
                 conf = inv_result.get("confidence", 0.0)
                 conf_color = "#10b981" if conf >= 0.85 else ("#f59e0b" if conf >= 0.70 else "#ef4444")
+                policy_ok = inv_result.get("policy_status") == "POLICY_APPROVED"
+                abstain = inv_result.get("should_abstain", False)
                 st.markdown(
                     f"""
                 <div style="background: rgba(15, 23, 42, 0.9); border: 1px solid #1e3a5f; border-radius: 8px; padding: 14px; margin-top: 10px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-weight: 700; color: #38bdf8;">ACTION: {inv_result.get("recommended_action")}</span>
+                        <span style="font-weight: 700; color: #38bdf8;">ACTION: {inv_result.get("proposed_action")}</span>
                         <span style="background: {conf_color}; color: #000; font-weight: 800; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem;">
                             CONFIDENCE: {int(conf * 100)}%
                         </span>
                     </div>
-                    <p style="margin-top: 8px; font-size: 0.9rem; color: #cbd5e1;">{inv_result.get("diagnosis")}</p>
+                    <p style="margin-top: 8px; font-size: 0.85rem; color: #f8fafc; font-weight: 600;">ROOT CAUSE: {inv_result.get("root_cause")}</p>
+                    <p style="margin-top: 4px; font-size: 0.9rem; color: #cbd5e1;">{inv_result.get("evidence_summary")}</p>
+                    {"<p style='color:#f87171;font-size:0.82rem;margin-top:6px;'>⚠️ ABSTAINED: " + str(inv_result.get("abstention_reason", "")) + "</p>" if abstain else ""}
                     <div style="margin-top: 6px; font-size: 0.78rem; color: #94a3b8;">
-                        <strong>Policy Gate Status:</strong> {"✅ PASSED" if inv_result.get("policy_gate_passed") else "❌ REJECTED"}
+                        <strong>Policy Gate Status:</strong> {"✅ PASSED" if policy_ok else "❌ REJECTED"} — {inv_result.get("policy_reason", "")[:100]}
                     </div>
                     <div style="margin-top: 4px; font-size: 0.78rem; color: #94a3b8;">
-                        <strong>Cited Records:</strong> <code>{", ".join(inv_result.get("cited_record_ids", []))}</code>
+                        <strong>Cited Records:</strong> <code>{", ".join(inv_result.get("evidence_record_ids", []))}</code>
+                    </div>
+                    <div style="margin-top: 4px; font-size: 0.72rem; color: #64748b;">
+                        Evidence Bundle Hash: <code>{inv_result.get("evidence_bundle_hash", "")[:40]}…</code>
                     </div>
                 </div>
                 """,
