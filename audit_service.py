@@ -10,9 +10,9 @@ Architectural Guarantees:
      from v_current_decisions view (the latest valid human_approvals entry).
 """
 
-from typing import Optional, Dict, Any, Union
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Union
 
 from db import get_db_cursor, get_db_path, log_audit_event
 
@@ -25,7 +25,7 @@ def record_human_approval(
     reviewer: str,
     notes: Optional[str] = None,
     investigation_id: Optional[int] = None,
-    db_path: Optional[Union[str, Path]] = None
+    db_path: Optional[Union[str, Path]] = None,
 ) -> int:
     """
     Appends a human FinOps approval or rejection to human_approvals and audit_events.
@@ -35,7 +35,9 @@ def record_human_approval(
     clean_action = str(action).upper().strip()
 
     if clean_action not in ALLOWED_APPROVAL_ACTIONS:
-        raise ValueError(f"Invalid approval action '{action}'. Must be one of: {sorted(list(ALLOWED_APPROVAL_ACTIONS))}")
+        raise ValueError(
+            f"Invalid approval action '{action}'. Must be one of: {sorted(list(ALLOWED_APPROVAL_ACTIONS))}"
+        )
 
     clean_reviewer = str(reviewer).strip()
     if not clean_reviewer:
@@ -44,10 +46,13 @@ def record_human_approval(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     with get_db_cursor(target_db) as cursor:
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO human_approvals (decision_id, investigation_id, action, reviewer, notes, created_at)
             VALUES (?, ?, ?, ?, ?, ?);
-        """, (decision_id, investigation_id, clean_action, clean_reviewer, notes or "", timestamp))
+        """,
+            (decision_id, investigation_id, clean_action, clean_reviewer, notes or "", timestamp),
+        )
         approval_id = cursor.lastrowid
 
     log_audit_event(
@@ -61,8 +66,8 @@ def record_human_approval(
             "investigation_id": investigation_id,
             "action": clean_action,
             "reviewer": clean_reviewer,
-            "notes": notes or ""
-        }
+            "notes": notes or "",
+        },
     )
 
     return approval_id

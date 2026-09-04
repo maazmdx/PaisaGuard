@@ -11,12 +11,11 @@ They cover every code path a judge or security reviewer would check:
   - Missing/empty header → function still returns (False, "none") cleanly
   - Short/malformed header lengths → no crash (compare_digest is length-safe)
 """
+
 import base64
 import hashlib
 import hmac
 import json
-
-import pytest
 
 # Import the pure verification function — no FastAPI required
 from api import verify_webhook_signature
@@ -24,14 +23,16 @@ from api import verify_webhook_signature
 SECRET = "rzp_sec_buildathon_2026_demo"
 WRONG_SECRET = "attacker_secret"
 
-PAYLOAD = json.dumps({
-    "event": "payment.captured",
-    "payment_id": "pay_hmac_test_001",
-    "order_id": "ord_in_hmac_001",
-    "amount": 1200.0,
-    "fee": 24.0,
-    "tax": 4.32
-}).encode("utf-8")
+PAYLOAD = json.dumps(
+    {
+        "event": "payment.captured",
+        "payment_id": "pay_hmac_test_001",
+        "order_id": "ord_in_hmac_001",
+        "amount": 1200.0,
+        "fee": 24.0,
+        "tax": 4.32,
+    }
+).encode("utf-8")
 
 
 def _make_sig(body: bytes, secret: str, encoding: str) -> str:
@@ -45,6 +46,7 @@ def _make_sig(body: bytes, secret: str, encoding: str) -> str:
 # ---------------------------------------------------------------------------
 # Happy-path tests
 # ---------------------------------------------------------------------------
+
 
 def test_hex_signature_accepted():
     sig = _make_sig(PAYLOAD, SECRET, "hex")
@@ -103,6 +105,7 @@ def test_both_encodings_work_for_same_payload():
 # ---------------------------------------------------------------------------
 # Rejection tests
 # ---------------------------------------------------------------------------
+
 
 def test_wrong_secret_rejected():
     sig = _make_sig(PAYLOAD, WRONG_SECRET, "hex")
@@ -165,6 +168,7 @@ def test_garbage_signature_rejected():
 def test_replay_webhooks_sample_events_compatibility():
     """Verify that all non-tampered sample events in replay_webhooks.py pass verification."""
     from replay_webhooks import SAMPLE_EVENTS
+
     for event_info in SAMPLE_EVENTS:
         payload_bytes = json.dumps(event_info["payload"]).encode("utf-8")
         digest = hmac.new(SECRET.encode("utf-8"), payload_bytes, hashlib.sha256).digest()
@@ -187,6 +191,7 @@ def test_replay_webhooks_sample_events_compatibility():
 # Idempotency test — verify_webhook_signature is stateless
 # ---------------------------------------------------------------------------
 
+
 def test_verification_is_stateless_and_repeatable():
     """Calling verify twice on the same input should always return the same result."""
     sig = _make_sig(PAYLOAD, SECRET, "hex")
@@ -199,14 +204,15 @@ def test_verification_is_stateless_and_repeatable():
 # Accumulator determinism test (uses recon_engine directly)
 # ---------------------------------------------------------------------------
 
+
 def test_repeated_pipeline_runs_are_deterministic():
     """
     Running the pipeline twice with reset_accumulator=True must produce the
     same match_rate and gst_tax_leakage, proving the engine is fully
     deterministic when starting from a clean accumulator state.
     """
-    from recon_engine import execute_reconciliation_pipeline
     from db import DEFAULT_DB_PATH
+    from recon_engine import execute_reconciliation_pipeline
 
     run1 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
     run2 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
@@ -224,13 +230,14 @@ def test_repeated_pipeline_runs_are_deterministic():
 # Accumulator continuity test
 # ---------------------------------------------------------------------------
 
+
 def test_accumulator_rolls_forward_across_runs():
     """
     When reset_accumulator=False, the second run should pick up the accumulator
     from the first run, producing a non-zero (compounded) drift.
     """
-    from recon_engine import execute_reconciliation_pipeline
     from db import DEFAULT_DB_PATH
+    from recon_engine import execute_reconciliation_pipeline
 
     run1 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
     run2 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=False)

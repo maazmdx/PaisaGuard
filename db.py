@@ -5,13 +5,13 @@ Engine: SQLite in WAL (Write-Ahead-Logging) mode with synchronous=NORMAL.
 Provides high-throughput concurrent reads and transactional writes.
 """
 
-import os
 import json
+import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, Union, Optional
-from contextlib import contextmanager
+from typing import Any, Dict, Optional, Union
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("PAISAGUARD_DB_PATH", str(BASE_DIR / "reconciliation.db")))
@@ -69,7 +69,7 @@ def log_audit_event(
     event_type: str,
     aggregate_type: str,
     aggregate_id: str,
-    payload: Dict[str, Any]
+    payload: Dict[str, Any],
 ) -> int:
     """
     Appends an immutable audit event to audit_events table.
@@ -78,17 +78,23 @@ def log_audit_event(
     payload_json = json.dumps(payload, sort_keys=True)
 
     if isinstance(conn_or_path, sqlite3.Connection):
-        cursor = conn_or_path.execute("""
+        cursor = conn_or_path.execute(
+            """
             INSERT INTO audit_events (event_type, aggregate_type, aggregate_id, payload_json, created_at)
             VALUES (?, ?, ?, ?, ?);
-        """, (event_type, aggregate_type, aggregate_id, payload_json, timestamp))
+        """,
+            (event_type, aggregate_type, aggregate_id, payload_json, timestamp),
+        )
         return cursor.lastrowid
     else:
         with get_db_cursor(conn_or_path) as cursor:
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO audit_events (event_type, aggregate_type, aggregate_id, payload_json, created_at)
                 VALUES (?, ?, ?, ?, ?);
-            """, (event_type, aggregate_type, aggregate_id, payload_json, timestamp))
+            """,
+                (event_type, aggregate_type, aggregate_id, payload_json, timestamp),
+            )
             return cursor.lastrowid
 
 

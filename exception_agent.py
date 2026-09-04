@@ -20,15 +20,16 @@ Architectural Guarantees:
    - Hashes evidence bundle and records prompt/model metadata in agent_investigations.
 """
 
+import hashlib
+import json
+import logging
 import os
 import sys
-import json
-import hashlib
-import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field, ValidationError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,8 +37,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from db import get_db_connection, get_db_cursor, get_db_path, log_audit_event
-from policy_gate import PolicyGatekeeper, ALLOWED_ACTIONS
-from money import require_paise
+from policy_gate import ALLOWED_ACTIONS, PolicyGatekeeper
 
 logger = logging.getLogger("paisaguard.agent")
 
@@ -48,6 +48,7 @@ AI_API_KEY_ENV = os.environ.get("AI_API_KEY", "")
 
 class ExceptionInvestigationResult(BaseModel):
     """Strict Pydantic model for AI FinOps investigation output."""
+
     root_cause: str = Field(..., description="Classified financial exception root cause")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0")
     evidence_record_ids: List[str] = Field(..., description="Cited source record IDs supporting the diagnosis")
@@ -81,16 +82,18 @@ class DeterministicMockProvider(BaseAIProvider):
 
         # 1. Deliberate Incoherent / Ambiguous Case -> Agent MUST Abstain
         if discrepancy == "GENUINE_AMBIGUITY_INSUFFICIENT_DATA" or "incoherent" in reason or "unknown" in reason:
-            return json.dumps({
-                "root_cause": "GENUINE_AMBIGUITY_INSUFFICIENT_DATA",
-                "confidence": 0.50,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"Incoherent data with unexplained variance of {variance_p} paise. Historical pattern is inconclusive.",
-                "proposed_action": "ABSTAIN",
-                "requires_human_approval": True,
-                "should_abstain": True,
-                "abstention_reason": "Conflicting transaction data with insufficient gateway audit history. Recommended for manual CFO escalation."
-            })
+            return json.dumps(
+                {
+                    "root_cause": "GENUINE_AMBIGUITY_INSUFFICIENT_DATA",
+                    "confidence": 0.50,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": f"Incoherent data with unexplained variance of {variance_p} paise. Historical pattern is inconclusive.",
+                    "proposed_action": "ABSTAIN",
+                    "requires_human_approval": True,
+                    "should_abstain": True,
+                    "abstention_reason": "Conflicting transaction data with insufficient gateway audit history. Recommended for manual CFO escalation.",
+                }
+            )
 
         # 2. Fee discrepancy evaluation
         if discrepancy in ("FEE_TAX_DISCREPANCY", "CORPORATE_CARD_SURCHARGE") or "fee discrepancy" in reason:
@@ -100,118 +103,136 @@ class DeterministicMockProvider(BaseAIProvider):
 
             # Commercial corporate card surcharge matches ~2.50% MDR (245 - 255 bps)
             if 245 <= rate_bps <= 255:
-                return json.dumps({
-                    "root_cause": "CORPORATE_CARD_SURCHARGE",
-                    "confidence": 0.95,
-                    "evidence_record_ids": available_ids,
-                    "evidence_summary": f"Detected 50 bps fee surcharge ({variance_p} paise variance) matching commercial credit card interchange tier (2.50% MDR).",
-                    "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
-                    "requires_human_approval": True,
-                    "should_abstain": False,
-                    "abstention_reason": None
-                })
+                return json.dumps(
+                    {
+                        "root_cause": "CORPORATE_CARD_SURCHARGE",
+                        "confidence": 0.95,
+                        "evidence_record_ids": available_ids,
+                        "evidence_summary": f"Detected 50 bps fee surcharge ({variance_p} paise variance) matching commercial credit card interchange tier (2.50% MDR).",
+                        "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
+                        "requires_human_approval": True,
+                        "should_abstain": False,
+                        "abstention_reason": None,
+                    }
+                )
             else:
                 # Ambiguous fee anomaly with no recognized tier -> deliberate abstention!
-                return json.dumps({
-                    "root_cause": "GENUINE_AMBIGUITY_INSUFFICIENT_DATA",
-                    "confidence": 0.50,
-                    "evidence_record_ids": available_ids,
-                    "evidence_summary": f"Incoherent fee deduction of {actual_fee_p} paise on gross {gross_p} paise ({rate_bps/100:.2f}% MDR). Does not match standard contract schedules.",
-                    "proposed_action": "ABSTAIN",
-                    "requires_human_approval": True,
-                    "should_abstain": True,
-                    "abstention_reason": "Non-standard fee deduction with no recognized contract schedule. Escalated for FinOps review."
-                })
+                return json.dumps(
+                    {
+                        "root_cause": "GENUINE_AMBIGUITY_INSUFFICIENT_DATA",
+                        "confidence": 0.50,
+                        "evidence_record_ids": available_ids,
+                        "evidence_summary": f"Incoherent fee deduction of {actual_fee_p} paise on gross {gross_p} paise ({rate_bps / 100:.2f}% MDR). Does not match standard contract schedules.",
+                        "proposed_action": "ABSTAIN",
+                        "requires_human_approval": True,
+                        "should_abstain": True,
+                        "abstention_reason": "Non-standard fee deduction with no recognized contract schedule. Escalated for FinOps review.",
+                    }
+                )
 
         # 3. Delayed bank payout credit
         if discrepancy == "DELAYED_BANK_CREDIT" or "not yet arrived in bank" in reason:
-            return json.dumps({
-                "root_cause": "DELAYED_BANK_CREDIT",
-                "confidence": 0.93,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"Settlement batch assigned to payout but bank UTR credit confirmation is pending.",
-                "proposed_action": "AWAIT_BANK_CREDIT",
-                "requires_human_approval": True,
-                "should_abstain": False,
-                "abstention_reason": None
-            })
+            return json.dumps(
+                {
+                    "root_cause": "DELAYED_BANK_CREDIT",
+                    "confidence": 0.93,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": "Settlement batch assigned to payout but bank UTR credit confirmation is pending.",
+                    "proposed_action": "AWAIT_BANK_CREDIT",
+                    "requires_human_approval": True,
+                    "should_abstain": False,
+                    "abstention_reason": None,
+                }
+            )
 
         # 4. Unsettled OMS order
         if discrepancy == "UNSETTLED_OMS_ORDER" or "no settlement recorded" in reason:
-            return json.dumps({
-                "root_cause": "UNSETTLED_OMS_ORDER",
-                "confidence": 0.92,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"OMS order captured internally; awaiting settlement credit cycle from Razorpay.",
-                "proposed_action": "AWAIT_SETTLEMENT",
-                "requires_human_approval": True,
-                "should_abstain": False,
-                "abstention_reason": None
-            })
+            return json.dumps(
+                {
+                    "root_cause": "UNSETTLED_OMS_ORDER",
+                    "confidence": 0.92,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": "OMS order captured internally; awaiting settlement credit cycle from Razorpay.",
+                    "proposed_action": "AWAIT_SETTLEMENT",
+                    "requires_human_approval": True,
+                    "should_abstain": False,
+                    "abstention_reason": None,
+                }
+            )
 
         # 5. Orphan settlement
         if discrepancy == "ORPHAN_SETTLEMENT" or "without corresponding internal oms" in reason:
-            return json.dumps({
-                "root_cause": "ORPHAN_SETTLEMENT",
-                "confidence": 0.89,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"Gateway settlement exists without corresponding OMS order ID in database.",
-                "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
-                "requires_human_approval": True,
-                "should_abstain": False,
-                "abstention_reason": None
-            })
+            return json.dumps(
+                {
+                    "root_cause": "ORPHAN_SETTLEMENT",
+                    "confidence": 0.89,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": "Gateway settlement exists without corresponding OMS order ID in database.",
+                    "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
+                    "requires_human_approval": True,
+                    "should_abstain": False,
+                    "abstention_reason": None,
+                }
+            )
 
         # 6. Partial refund / amount mismatch
         if discrepancy == "PARTIAL_REFUND_MISMATCH" or "gross amount mismatch" in reason:
-            return json.dumps({
-                "root_cause": "PARTIAL_REFUND_MISMATCH",
-                "confidence": 0.87,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"Settled amount differs from OMS gross amount by {variance_p} paise, indicating partial refund or adjustment.",
-                "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
-                "requires_human_approval": True,
-                "should_abstain": False,
-                "abstention_reason": None
-            })
+            return json.dumps(
+                {
+                    "root_cause": "PARTIAL_REFUND_MISMATCH",
+                    "confidence": 0.87,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": f"Settled amount differs from OMS gross amount by {variance_p} paise, indicating partial refund or adjustment.",
+                    "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
+                    "requires_human_approval": True,
+                    "should_abstain": False,
+                    "abstention_reason": None,
+                }
+            )
 
         # 7. Bank payout amount mismatch
         if discrepancy == "BANK_AMOUNT_MISMATCH" or "bank credit mismatch" in reason:
-            return json.dumps({
-                "root_cause": "BANK_AMOUNT_MISMATCH",
-                "confidence": 0.90,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"Total settlement net amount does not match bank credit amount by {variance_p} paise.",
-                "proposed_action": "INITIATE_GATEWAY_DISPUTE",
-                "requires_human_approval": True,
-                "should_abstain": False,
-                "abstention_reason": None
-            })
+            return json.dumps(
+                {
+                    "root_cause": "BANK_AMOUNT_MISMATCH",
+                    "confidence": 0.90,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": f"Total settlement net amount does not match bank credit amount by {variance_p} paise.",
+                    "proposed_action": "INITIATE_GATEWAY_DISPUTE",
+                    "requires_human_approval": True,
+                    "should_abstain": False,
+                    "abstention_reason": None,
+                }
+            )
 
         # 8. Unidentified direct credit
         if discrepancy == "UNIDENTIFIED_DIRECT_CREDIT" or "direct bank credit" in reason:
-            return json.dumps({
-                "root_cause": "UNIDENTIFIED_DIRECT_CREDIT",
-                "confidence": 0.91,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"Unmatched direct credit of {variance_p} paise with no associated gateway settlement payout.",
-                "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
-                "requires_human_approval": True,
-                "should_abstain": False,
-                "abstention_reason": None
-            })
+            return json.dumps(
+                {
+                    "root_cause": "UNIDENTIFIED_DIRECT_CREDIT",
+                    "confidence": 0.91,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": f"Unmatched direct credit of {variance_p} paise with no associated gateway settlement payout.",
+                    "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
+                    "requires_human_approval": True,
+                    "should_abstain": False,
+                    "abstention_reason": None,
+                }
+            )
 
         # Default fallback
-        return json.dumps({
-            "root_cause": "UNKNOWN_DISCREPANCY",
-            "confidence": 0.60,
-            "evidence_record_ids": available_ids,
-            "evidence_summary": f"Generic discrepancy detected: {discrepancy}",
-            "proposed_action": "ABSTAIN",
-            "requires_human_approval": True,
-            "should_abstain": True,
-            "abstention_reason": "Low confidence match on non-standard exception pattern."
-        })
+        return json.dumps(
+            {
+                "root_cause": "UNKNOWN_DISCREPANCY",
+                "confidence": 0.60,
+                "evidence_record_ids": available_ids,
+                "evidence_summary": f"Generic discrepancy detected: {discrepancy}",
+                "proposed_action": "ABSTAIN",
+                "requires_human_approval": True,
+                "should_abstain": True,
+                "abstention_reason": "Low confidence match on non-standard exception pattern.",
+            }
+        )
 
 
 class GeminiProvider(BaseAIProvider):
@@ -228,15 +249,12 @@ class GeminiProvider(BaseAIProvider):
 
     def investigate(self, prompt: str, evidence: Dict[str, Any]) -> str:
         import requests
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
         headers = {"Content-Type": "application/json"}
         payload = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "response_mime_type": "application/json"
-            }
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"response_mime_type": "application/json"},
         }
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=12.0)
@@ -260,9 +278,7 @@ def get_ai_provider() -> BaseAIProvider:
 
 
 def investigate_exception(
-    decision_id: int,
-    db_path: Optional[Path] = None,
-    provider: Optional[BaseAIProvider] = None
+    decision_id: int, db_path: Optional[Path] = None, provider: Optional[BaseAIProvider] = None
 ) -> Dict[str, Any]:
     """
     Performs AI investigation of a reconciliation decision:
@@ -277,12 +293,15 @@ def investigate_exception(
     cursor = conn.cursor()
 
     # Load decision record
-    row = cursor.execute("""
+    row = cursor.execute(
+        """
         SELECT decision_id, subject_type, subject_id, business_tx_id, order_id,
                payment_id, payout_id, credit_id, match_status, discrepancy_code,
                variance_paise, evidence_json
         FROM reconciliation_decisions WHERE decision_id = ?;
-    """, (decision_id,)).fetchone()
+    """,
+        (decision_id,),
+    ).fetchone()
 
     if not row:
         conn.close()
@@ -316,7 +335,7 @@ def investigate_exception(
         "gross_amount_paise": evidence_dict.get("amount_paise", evidence_dict.get("oms_amount_paise", 0)),
         "actual_fee_paise": evidence_dict.get("actual_fee_paise", evidence_dict.get("fee_paise", 0)),
         "reason": evidence_dict.get("reason", ""),
-        "available_record_ids": valid_ids
+        "available_record_ids": valid_ids,
     }
 
     evidence_bundle_bytes = json.dumps(minimized_evidence, sort_keys=True).encode("utf-8")
@@ -355,21 +374,27 @@ Return strict JSON with fields:
                 logger.warning(f"Hallucinated citation detected: '{cited_id}' not in evidence {valid_ids}")
                 result.should_abstain = True
                 result.proposed_action = "ABSTAIN"
-                result.abstention_reason = f"Verification failure: Cited record '{cited_id}' not present in source evidence bundle."
+                result.abstention_reason = (
+                    f"Verification failure: Cited record '{cited_id}' not present in source evidence bundle."
+                )
                 break
 
         # Action whitelist guardrail
         if result.proposed_action not in ALLOWED_ACTIONS:
             result.should_abstain = True
             result.proposed_action = "ABSTAIN"
-            result.abstention_reason = f"Verification failure: Proposed action '{result.proposed_action}' not permitted."
+            result.abstention_reason = (
+                f"Verification failure: Proposed action '{result.proposed_action}' not permitted."
+            )
 
         # Low confidence guardrail
         if result.confidence < 0.70:
             result.should_abstain = True
             result.proposed_action = "ABSTAIN"
             if not result.abstention_reason:
-                result.abstention_reason = f"Agent abstention: Confidence score {result.confidence:.2f} is below safety threshold 0.70."
+                result.abstention_reason = (
+                    f"Agent abstention: Confidence score {result.confidence:.2f} is below safety threshold 0.70."
+                )
 
     except (ValidationError, json.JSONDecodeError, Exception) as exc:
         logger.error(f"AI investigation provider failure: {exc}")
@@ -382,7 +407,7 @@ Return strict JSON with fields:
             proposed_action="ABSTAIN",
             requires_human_approval=True,
             should_abstain=True,
-            abstention_reason=f"Agent abstention: Provider failure ({exc}). Fallback to manual review."
+            abstention_reason=f"Agent abstention: Provider failure ({exc}). Fallback to manual review.",
         )
 
     # Deterministic Policy Gatekeeper Evaluation
@@ -395,7 +420,7 @@ Return strict JSON with fields:
         actual_fee_paise=actual_fee,
         expected_fee_paise=expected_fee,
         variance_paise=variance_paise,
-        proposed_action=result.proposed_action
+        proposed_action=result.proposed_action,
     )
 
     policy_status = "POLICY_APPROVED" if policy_approved else "POLICY_REJECTED"
@@ -403,30 +428,33 @@ Return strict JSON with fields:
     # Persist investigation into agent_investigations table
     timestamp = datetime.now(timezone.utc).isoformat()
     with get_db_cursor(target_db) as cur:
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO agent_investigations (
                 decision_id, evidence_bundle_hash, provider, model,
                 root_cause, confidence, evidence_record_ids, evidence_summary,
                 proposed_action, should_abstain, abstention_reason,
                 policy_status, policy_reason, raw_response, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (
-            decision_id,
-            evidence_bundle_hash,
-            provider_name,
-            model_name,
-            result.root_cause,
-            result.confidence,
-            json.dumps(result.evidence_record_ids),
-            result.evidence_summary,
-            result.proposed_action,
-            1 if result.should_abstain else 0,
-            result.abstention_reason,
-            policy_status,
-            policy_reason,
-            raw_response,
-            timestamp
-        ))
+        """,
+            (
+                decision_id,
+                evidence_bundle_hash,
+                provider_name,
+                model_name,
+                result.root_cause,
+                result.confidence,
+                json.dumps(result.evidence_record_ids),
+                result.evidence_summary,
+                result.proposed_action,
+                1 if result.should_abstain else 0,
+                result.abstention_reason,
+                policy_status,
+                policy_reason,
+                raw_response,
+                timestamp,
+            ),
+        )
         investigation_id = cur.lastrowid
 
     log_audit_event(
@@ -440,8 +468,8 @@ Return strict JSON with fields:
             "confidence": result.confidence,
             "should_abstain": result.should_abstain,
             "policy_status": policy_status,
-            "proposed_action": result.proposed_action
-        }
+            "proposed_action": result.proposed_action,
+        },
     )
 
     conn.close()
@@ -460,5 +488,5 @@ Return strict JSON with fields:
         "abstention_reason": result.abstention_reason,
         "policy_status": policy_status,
         "policy_reason": policy_reason,
-        "created_at": timestamp
+        "created_at": timestamp,
     }

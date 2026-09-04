@@ -3,15 +3,17 @@ test_money.py — Unit tests for canonical integer paise precision and safety gu
 """
 
 from decimal import Decimal
+
 import pytest
+
 from money import (
+    calc_mdr_fee_and_tax_paise,
+    format_paise_inr,
+    paise_to_rupees,
     parse_inr_to_paise,
     require_paise,
-    paise_to_rupees,
-    format_paise_inr,
-    calc_mdr_fee_and_tax_paise,
+    round_curr,
     to_decimal,
-    round_curr
 )
 
 

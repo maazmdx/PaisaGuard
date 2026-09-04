@@ -17,35 +17,27 @@ Covers:
 13. Read endpoints for isolated dashboard.
 """
 
-import os
-import hmac
 import hashlib
+import hmac
 import json
-import sqlite3
-import pytest
-from pathlib import Path
+import os
 from decimal import Decimal
+from pathlib import Path
+
+import pytest
 from fastapi.testclient import TestClient
 
-from db import init_db, get_db_connection, get_db_path, log_audit_event
-from seed_data import seed_database
-from recon_engine import execute_reconciliation_pipeline
-from exception_agent import (
-    investigate_exception,
-    ExceptionInvestigationResult,
-    BaseAIProvider,
-    DeterministicMockProvider
-)
-from policy_gate import PolicyGatekeeper
-from audit_service import record_human_approval
-from money import (
-    parse_inr_to_paise,
-    require_paise,
-    paise_to_rupees,
-    format_paise_inr,
-    calc_mdr_fee_and_tax_paise
-)
 from api import app
+from audit_service import record_human_approval
+from db import get_db_connection
+from exception_agent import (
+    BaseAIProvider,
+    investigate_exception,
+)
+from money import calc_mdr_fee_and_tax_paise, parse_inr_to_paise, require_paise
+from policy_gate import PolicyGatekeeper
+from recon_engine import execute_reconciliation_pipeline
+from seed_data import seed_database
 
 TEST_DB_PATH = Path(__file__).resolve().parent / "test_paisa_guard.db"
 TEST_SECRET = "rzp_sec_test_secret_2026"
@@ -148,7 +140,7 @@ def test_reconciliation_rerun_idempotency(setup_test_db):
     conn.close()
 
     # Re-run pipeline over unchanged inputs
-    summary_2 = execute_reconciliation_pipeline(db_path=setup_test_db, include_held_out=False)
+    execute_reconciliation_pipeline(db_path=setup_test_db, include_held_out=False)
 
     conn = get_db_connection(setup_test_db)
     decisions_after = conn.execute("SELECT COUNT(*) FROM reconciliation_decisions").fetchone()[0]
@@ -209,12 +201,14 @@ def test_webhook_hmac_enforcement_and_tampering(setup_test_db, monkeypatch):
         "amount_paise": 149900,
         "fee_paise": 2998,
         "tax_paise": 540,
-        "payment_method": "upi"
+        "payment_method": "upi",
     }
     payload_bytes = json.dumps(payload).encode("utf-8")
 
     # 1. Unsigned request must be rejected with 401
-    res_unsigned = client.post("/webhooks/razorpay", content=payload_bytes, headers={"Content-Type": "application/json"})
+    res_unsigned = client.post(
+        "/webhooks/razorpay", content=payload_bytes, headers={"Content-Type": "application/json"}
+    )
     assert res_unsigned.status_code == 401
     assert "Missing X-Razorpay-Signature" in res_unsigned.json()["detail"]
 
@@ -223,7 +217,7 @@ def test_webhook_hmac_enforcement_and_tampering(setup_test_db, monkeypatch):
     res_hex = client.post(
         "/webhooks/razorpay",
         content=payload_bytes,
-        headers={"Content-Type": "application/json", "X-Razorpay-Signature": hex_sig}
+        headers={"Content-Type": "application/json", "X-Razorpay-Signature": hex_sig},
     )
     assert res_hex.status_code == 200
     assert res_hex.json()["status"] == "ingested"
@@ -233,7 +227,7 @@ def test_webhook_hmac_enforcement_and_tampering(setup_test_db, monkeypatch):
     res_tampered = client.post(
         "/webhooks/razorpay",
         content=tampered_bytes,
-        headers={"Content-Type": "application/json", "X-Razorpay-Signature": hex_sig}
+        headers={"Content-Type": "application/json", "X-Razorpay-Signature": hex_sig},
     )
     assert res_tampered.status_code == 401
 
@@ -252,7 +246,7 @@ def test_webhook_deduplication(setup_test_db, monkeypatch):
         "payment_id": "pay_unique_dedup_99",
         "amount_paise": 249900,
         "fee_paise": 4998,
-        "tax_paise": 900
+        "tax_paise": 900,
     }
     raw = json.dumps(payload).encode("utf-8")
     sig = hmac.new(TEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
@@ -279,7 +273,9 @@ def test_webhook_deduplication(setup_test_db, monkeypatch):
 # -------------------------------------------------------------
 def test_ai_investigation_citations_and_schema(setup_test_db):
     conn = get_db_connection(setup_test_db)
-    row = conn.execute("SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1").fetchone()
+    row = conn.execute(
+        "SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1"
+    ).fetchone()
     conn.close()
 
     assert row is not None
@@ -337,46 +333,54 @@ class MalformedProvider(BaseAIProvider):
 
 class HallucinatingProvider(BaseAIProvider):
     def investigate(self, prompt: str, evidence: dict) -> str:
-        return json.dumps({
-            "root_cause": "FAKE_DIAGNOSIS",
-            "confidence": 0.95,
-            "evidence_record_ids": ["hallucinated_record_id_not_in_evidence"],
-            "evidence_summary": "Made up evidence",
-            "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
-            "requires_human_approval": True,
-            "should_abstain": False
-        })
+        return json.dumps(
+            {
+                "root_cause": "FAKE_DIAGNOSIS",
+                "confidence": 0.95,
+                "evidence_record_ids": ["hallucinated_record_id_not_in_evidence"],
+                "evidence_summary": "Made up evidence",
+                "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
+                "requires_human_approval": True,
+                "should_abstain": False,
+            }
+        )
 
 
 class UnsupportedActionProvider(BaseAIProvider):
     def investigate(self, prompt: str, evidence: dict) -> str:
-        return json.dumps({
-            "root_cause": "TEST_CAUSE",
-            "confidence": 0.95,
-            "evidence_record_ids": evidence.get("available_record_ids", []),
-            "evidence_summary": "Summary",
-            "proposed_action": "DELETE_ALL_RECORDS",  # Prohibited action!
-            "requires_human_approval": True,
-            "should_abstain": False
-        })
+        return json.dumps(
+            {
+                "root_cause": "TEST_CAUSE",
+                "confidence": 0.95,
+                "evidence_record_ids": evidence.get("available_record_ids", []),
+                "evidence_summary": "Summary",
+                "proposed_action": "DELETE_ALL_RECORDS",  # Prohibited action!
+                "requires_human_approval": True,
+                "should_abstain": False,
+            }
+        )
 
 
 class LowConfidenceProvider(BaseAIProvider):
     def investigate(self, prompt: str, evidence: dict) -> str:
-        return json.dumps({
-            "root_cause": "UNCERTAIN_CAUSE",
-            "confidence": 0.45,  # Low confidence
-            "evidence_record_ids": evidence.get("available_record_ids", []),
-            "evidence_summary": "Uncertain summary",
-            "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
-            "requires_human_approval": True,
-            "should_abstain": False
-        })
+        return json.dumps(
+            {
+                "root_cause": "UNCERTAIN_CAUSE",
+                "confidence": 0.45,  # Low confidence
+                "evidence_record_ids": evidence.get("available_record_ids", []),
+                "evidence_summary": "Uncertain summary",
+                "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
+                "requires_human_approval": True,
+                "should_abstain": False,
+            }
+        )
 
 
 def test_ai_agent_failure_modes(setup_test_db):
     conn = get_db_connection(setup_test_db)
-    row = conn.execute("SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1").fetchone()
+    row = conn.execute(
+        "SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1"
+    ).fetchone()
     conn.close()
     dec_id = row["decision_id"]
 
@@ -408,7 +412,7 @@ def test_policy_gate_rejection():
         actual_fee_paise=6000,
         expected_fee_paise=2000,
         variance_paise=7000,  # 7,000 paise > 5,000 ceiling!
-        proposed_action="ACCEPT_SURCHARGE_ADJUSTMENT"
+        proposed_action="ACCEPT_SURCHARGE_ADJUSTMENT",
     )
     assert approved is False
     assert "exceeds hard safety ceiling" in reason
@@ -419,7 +423,7 @@ def test_policy_gate_rejection():
         actual_fee_paise=4000,  # 4.0% > 3.50% cap
         expected_fee_paise=2000,
         variance_paise=2000,
-        proposed_action="ACCEPT_SURCHARGE_ADJUSTMENT"
+        proposed_action="ACCEPT_SURCHARGE_ADJUSTMENT",
     )
     assert approved_cap is False
     assert "breaches statutory merchant contract cap" in reason_cap
@@ -430,13 +434,17 @@ def test_policy_gate_rejection():
 # -------------------------------------------------------------
 def test_human_approval_append_only(setup_test_db):
     conn = get_db_connection(setup_test_db)
-    row = conn.execute("SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1").fetchone()
+    row = conn.execute(
+        "SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1"
+    ).fetchone()
     conn.close()
     dec_id = row["decision_id"]
 
     # Check projection before approval
     conn = get_db_connection(setup_test_db)
-    before_view = conn.execute("SELECT current_disposition FROM v_current_decisions WHERE decision_id = ?", (dec_id,)).fetchone()
+    before_view = conn.execute(
+        "SELECT current_disposition FROM v_current_decisions WHERE decision_id = ?", (dec_id,)
+    ).fetchone()
     conn.close()
     assert before_view["current_disposition"] == "UNRESOLVED"
 
@@ -446,7 +454,7 @@ def test_human_approval_append_only(setup_test_db):
         action="APPROVE",
         reviewer="auditor_jane",
         notes="Validated against merchant contract",
-        db_path=setup_test_db
+        db_path=setup_test_db,
     )
     assert app_id > 0
 
@@ -457,7 +465,9 @@ def test_human_approval_append_only(setup_test_db):
     assert app_row["action"] == "APPROVE"
 
     # Verify projection view shows latest disposition
-    after_view = conn.execute("SELECT current_disposition, resolved_by FROM v_current_decisions WHERE decision_id = ?", (dec_id,)).fetchone()
+    after_view = conn.execute(
+        "SELECT current_disposition, resolved_by FROM v_current_decisions WHERE decision_id = ?", (dec_id,)
+    ).fetchone()
     assert after_view["current_disposition"] == "APPROVE"
     assert after_view["resolved_by"] == "auditor_jane"
 

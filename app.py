@@ -15,15 +15,14 @@ Architectural Guarantees:
 - Reviewers provide operator identity only (e.g. name / email), never raw secrets.
 """
 
-import os
-import sys
 import json
+import os
 import time
-from typing import Dict, Any, Optional, List
-import requests
+from typing import Any, Dict, Optional, Tuple
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 # Environment & API Gateway Configuration
@@ -35,11 +34,12 @@ st.set_page_config(
     page_title="PaisaGuard | Razorpay AI Finance Controller",
     page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 # High-End Dark Fintech Theme Styling
-st.markdown("""
+st.markdown(
+    """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
@@ -159,7 +159,9 @@ st.markdown("""
         font-family: 'JetBrains Mono', monospace !important;
     }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # HTTP Helper functions (Zero direct DB connection)
@@ -179,7 +181,9 @@ def api_get(path: str) -> Optional[Dict[str, Any]]:
             st.error(f"API Error ({resp.status_code}) on {path}: {resp.text}")
         return None
     except requests.exceptions.ConnectionError:
-        st.error(f"🔌 Connection failed: Cannot reach PaisaGuard API at `{API_URL}`. Verify the FastAPI service is running.")
+        st.error(
+            f"🔌 Connection failed: Cannot reach PaisaGuard API at `{API_URL}`. Verify the FastAPI service is running."
+        )
         return None
     except Exception as exc:
         st.error(f"Unexpected error communicating with API: {exc}")
@@ -220,7 +224,8 @@ status_pill = (
     else '<span class="rzp-status-pill-warn">● READ-ONLY (TOKEN UNCONFIGURED)</span>'
 )
 
-st.markdown(f"""
+st.markdown(
+    f"""
 <div class="rzp-navbar">
     <div class="rzp-brand">
         <div class="rzp-logo-badge">PG</div>
@@ -233,7 +238,9 @@ st.markdown(f"""
         {status_pill}
     </div>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # Security Alert Notice if Token is Unset
 if not token_configured:
@@ -245,10 +252,16 @@ if not token_configured:
 
 # Sidebar Controls
 with st.sidebar:
-    st.image("https://img.shields.io/badge/PaisaGuard-v3.0.0-blue?style=for-the-badge&logo=shield", use_container_width=True)
+    st.image(
+        "https://img.shields.io/badge/PaisaGuard-v3.0.0-blue?style=for-the-badge&logo=shield", use_container_width=True
+    )
     st.markdown("### FinOps Operator Controls")
 
-    reviewer_id = st.text_input("Operator / Reviewer Identity", value="auditor_ops", help="Your operator identifier recorded in the append-only audit trail.")
+    reviewer_id = st.text_input(
+        "Operator / Reviewer Identity",
+        value="auditor_ops",
+        help="Your operator identifier recorded in the append-only audit trail.",
+    )
 
     st.markdown("---")
     st.markdown("### Deterministic Sweep")
@@ -282,13 +295,15 @@ if not metrics_data:
     st.stop()
 
 # Tab Navigation: 5 Consolidated Surfaces
-tab_kpi, tab_payouts, tab_exceptions, tab_approvals, tab_benchmarks = st.tabs([
-    "📊 Batch KPI Board",
-    "🏦 Payout Batches",
-    "🔍 Exceptions & AI Investigator",
-    "📜 Audit & Human Approval Log",
-    "🎯 Benchmark & Accuracy Console"
-])
+tab_kpi, tab_payouts, tab_exceptions, tab_approvals, tab_benchmarks = st.tabs(
+    [
+        "📊 Batch KPI Board",
+        "🏦 Payout Batches",
+        "🔍 Exceptions & AI Investigator",
+        "📜 Audit & Human Approval Log",
+        "🎯 Benchmark & Accuracy Console",
+    ]
+)
 
 # -------------------------------------------------------------
 # SURFACE 1: BATCH KPI BOARD
@@ -301,37 +316,49 @@ with tab_kpi:
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="kpi-card">
             <div class="kpi-title">Txn Match Rate</div>
-            <div class="kpi-value">{tx_m.get('match_rate_percent', 0.0)}%</div>
-            <div class="kpi-sub">{tx_m.get('matched_count', 0)} of {tx_m.get('total_business_transactions', 0)} Transactions</div>
+            <div class="kpi-value">{tx_m.get("match_rate_percent", 0.0)}%</div>
+            <div class="kpi-sub">{tx_m.get("matched_count", 0)} of {tx_m.get("total_business_transactions", 0)} Transactions</div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
     with col2:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="kpi-card">
             <div class="kpi-title">Payout Match Rate</div>
-            <div class="kpi-value">{po_m.get('match_rate_percent', 0.0)}%</div>
-            <div class="kpi-sub">{po_m.get('matched_count', 0)} of {po_m.get('total_payout_batches', 0)} Payout Batches</div>
+            <div class="kpi-value">{po_m.get("match_rate_percent", 0.0)}%</div>
+            <div class="kpi-sub">{po_m.get("matched_count", 0)} of {po_m.get("total_payout_batches", 0)} Payout Batches</div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
     with col3:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="kpi-card">
             <div class="kpi-title">Open Exceptions</div>
-            <div class="kpi-value" style="color: #f87171;">{tx_m.get('exception_count', 0) + po_m.get('exception_count', 0)}</div>
-            <div class="kpi-sub">{tx_m.get('exception_count', 0)} Txn / {po_m.get('exception_count', 0)} Payout</div>
+            <div class="kpi-value" style="color: #f87171;">{tx_m.get("exception_count", 0) + po_m.get("exception_count", 0)}</div>
+            <div class="kpi-sub">{tx_m.get("exception_count", 0)} Txn / {po_m.get("exception_count", 0)} Payout</div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
     with col4:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="kpi-card">
             <div class="kpi-title">Total Source Records</div>
-            <div class="kpi-value">{counts.get('oms_orders', 0) + counts.get('razorpay_settlements', 0) + counts.get('bank_payout_credits', 0)}</div>
-            <div class="kpi-sub">{counts.get('oms_orders', 0)} OMS / {counts.get('razorpay_settlements', 0)} RZP / {counts.get('bank_payout_credits', 0)} Bank</div>
+            <div class="kpi-value">{counts.get("oms_orders", 0) + counts.get("razorpay_settlements", 0) + counts.get("bank_payout_credits", 0)}</div>
+            <div class="kpi-sub">{counts.get("oms_orders", 0)} OMS / {counts.get("razorpay_settlements", 0)} RZP / {counts.get("bank_payout_credits", 0)} Bank</div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
 
     # Discrepancy Breakdown Visuals
     st.markdown("---")
@@ -352,13 +379,9 @@ with tab_kpi:
                 names="Discrepancy Code",
                 hole=0.45,
                 color_discrete_sequence=["#0284c7", "#f59e0b", "#ef4444", "#8b5cf6", "#10b981"],
-                title="Exceptions by Root Cause"
+                title="Exceptions by Root Cause",
             )
-            fig_pie.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font_color="#f1f5f9"
-            )
+            fig_pie.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f1f5f9")
             st.plotly_chart(fig_pie, use_container_width=True)
 
         with col_c2:
@@ -370,13 +393,9 @@ with tab_kpi:
                 y="Count",
                 color="Disposition",
                 color_discrete_map={"UNRESOLVED": "#f59e0b", "APPROVE": "#10b981", "REJECT": "#ef4444"},
-                title="Current Disposition Status"
+                title="Current Disposition Status",
             )
-            fig_bar.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font_color="#f1f5f9"
-            )
+            fig_bar.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#f1f5f9")
             st.plotly_chart(fig_bar, use_container_width=True)
     else:
         st.success("🎉 All operational transactions and payout batches are 100% matched with zero open exceptions!")
@@ -404,7 +423,16 @@ with tab_payouts:
                 lambda p: f"₹{p / 100:,.2f}" if pd.notnull(p) else "Pending"
             )
         cols_to_show = [
-            col for col in ["payout_id", "settlement_count", "Batch Net (₹)", "bank_credit_id", "Bank Credited (₹)", "status", "discrepancy_code"]
+            col
+            for col in [
+                "payout_id",
+                "settlement_count",
+                "Batch Net (₹)",
+                "bank_credit_id",
+                "Bank Credited (₹)",
+                "status",
+                "discrepancy_code",
+            ]
             if col in df_po_display.columns
         ]
         st.dataframe(df_po_display[cols_to_show], use_container_width=True, hide_index=True)
@@ -418,7 +446,9 @@ with tab_payouts:
         df_unmatched = pd.DataFrame(unmatched_credits)
         if "credit_amount_paise" in df_unmatched.columns:
             df_unmatched["Amount (₹)"] = df_unmatched["credit_amount_paise"].apply(lambda p: f"₹{p / 100:,.2f}")
-        cols_un = [c for c in ["credit_id", "utr_number", "Amount (₹)", "status", "created_at"] if c in df_unmatched.columns]
+        cols_un = [
+            c for c in ["credit_id", "utr_number", "Amount (₹)", "status", "created_at"] if c in df_unmatched.columns
+        ]
         st.dataframe(df_unmatched[cols_un], use_container_width=True, hide_index=True)
 
 
@@ -451,8 +481,12 @@ with tab_exceptions:
             st.markdown(f"**Decision ID**: `{dec_id}`")
             st.markdown(f"**Subject**: `{selected_exc['subject_type']}` | `{selected_exc['subject_id']}`")
             st.markdown(f"**Discrepancy Code**: `{selected_exc['discrepancy_code']}`")
-            st.markdown(f"**Variance**: `₹{selected_exc['variance_paise'] / 100:,.2f}` ({selected_exc['variance_paise']} paise)")
-            st.markdown(f"**Current Disposition**: `{selected_exc['current_disposition']}` (by `{selected_exc['resolved_by'] or 'UNRESOLVED'}`)")
+            st.markdown(
+                f"**Variance**: `₹{selected_exc['variance_paise'] / 100:,.2f}` ({selected_exc['variance_paise']} paise)"
+            )
+            st.markdown(
+                f"**Current Disposition**: `{selected_exc['current_disposition']}` (by `{selected_exc['resolved_by'] or 'UNRESOLVED'}`)"
+            )
 
             # Parse evidence JSON
             ev_raw = selected_exc.get("evidence", "{}")
@@ -467,7 +501,9 @@ with tab_exceptions:
             st.caption("Read-only agent evaluates minimized evidence and returns structured diagnosis with citations.")
 
             # Button to trigger AI investigation
-            investigate_btn = st.button("🤖 Run AI Agent Investigation", disabled=not token_configured, key=f"inv_{dec_id}")
+            investigate_btn = st.button(
+                "🤖 Run AI Agent Investigation", disabled=not token_configured, key=f"inv_{dec_id}"
+            )
             if investigate_btn:
                 with st.spinner("Querying FinOps Agent and validating policy gate..."):
                     success, inv_resp = api_post("/ai/investigate", {"decision_id": dec_id})
@@ -482,38 +518,48 @@ with tab_exceptions:
             if inv_result:
                 conf = inv_result.get("confidence", 0.0)
                 conf_color = "#10b981" if conf >= 0.85 else ("#f59e0b" if conf >= 0.70 else "#ef4444")
-                st.markdown(f"""
+                st.markdown(
+                    f"""
                 <div style="background: rgba(15, 23, 42, 0.9); border: 1px solid #1e3a5f; border-radius: 8px; padding: 14px; margin-top: 10px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-weight: 700; color: #38bdf8;">ACTION: {inv_result.get('recommended_action')}</span>
+                        <span style="font-weight: 700; color: #38bdf8;">ACTION: {inv_result.get("recommended_action")}</span>
                         <span style="background: {conf_color}; color: #000; font-weight: 800; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem;">
                             CONFIDENCE: {int(conf * 100)}%
                         </span>
                     </div>
-                    <p style="margin-top: 8px; font-size: 0.9rem; color: #cbd5e1;">{inv_result.get('diagnosis')}</p>
+                    <p style="margin-top: 8px; font-size: 0.9rem; color: #cbd5e1;">{inv_result.get("diagnosis")}</p>
                     <div style="margin-top: 6px; font-size: 0.78rem; color: #94a3b8;">
-                        <strong>Policy Gate Status:</strong> {'✅ PASSED' if inv_result.get('policy_gate_passed') else '❌ REJECTED'}
+                        <strong>Policy Gate Status:</strong> {"✅ PASSED" if inv_result.get("policy_gate_passed") else "❌ REJECTED"}
                     </div>
                     <div style="margin-top: 4px; font-size: 0.78rem; color: #94a3b8;">
-                        <strong>Cited Records:</strong> <code>{', '.join(inv_result.get('cited_record_ids', []))}</code>
+                        <strong>Cited Records:</strong> <code>{", ".join(inv_result.get("cited_record_ids", []))}</code>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """,
+                    unsafe_allow_html=True,
+                )
 
             # Human Approval / Rejection Action Area
             st.markdown("---")
             st.markdown("#### Human Operator Action")
-            notes = st.text_area("Audit Justification / Notes", value="Verified against partner contract specifications.", key=f"notes_{dec_id}")
+            notes = st.text_area(
+                "Audit Justification / Notes",
+                value="Verified against partner contract specifications.",
+                key=f"notes_{dec_id}",
+            )
 
             col_act1, col_act2 = st.columns(2)
             with col_act1:
-                if st.button("✅ Approve Recommendation", disabled=not token_configured, key=f"app_{dec_id}", use_container_width=True):
-                    succ, res = api_post("/approvals/decision", {
-                        "decision_id": dec_id,
-                        "action": "APPROVE",
-                        "reviewer": reviewer_id,
-                        "notes": notes
-                    })
+                if st.button(
+                    "✅ Approve Recommendation",
+                    disabled=not token_configured,
+                    key=f"app_{dec_id}",
+                    use_container_width=True,
+                ):
+                    succ, res = api_post(
+                        "/approvals/decision",
+                        {"decision_id": dec_id, "action": "APPROVE", "reviewer": reviewer_id, "notes": notes},
+                    )
                     if succ:
                         st.success(f"Approval recorded! Approval ID: {res.get('approval_id')}")
                         time.sleep(1)
@@ -521,13 +567,13 @@ with tab_exceptions:
                     else:
                         st.error(f"Approval failed: {res}")
             with col_act2:
-                if st.button("❌ Reject / Escalate", disabled=not token_configured, key=f"rej_{dec_id}", use_container_width=True):
-                    succ, res = api_post("/approvals/decision", {
-                        "decision_id": dec_id,
-                        "action": "REJECT",
-                        "reviewer": reviewer_id,
-                        "notes": notes
-                    })
+                if st.button(
+                    "❌ Reject / Escalate", disabled=not token_configured, key=f"rej_{dec_id}", use_container_width=True
+                ):
+                    succ, res = api_post(
+                        "/approvals/decision",
+                        {"decision_id": dec_id, "action": "REJECT", "reviewer": reviewer_id, "notes": notes},
+                    )
                     if succ:
                         st.success(f"Rejection recorded! Approval ID: {res.get('approval_id')}")
                         time.sleep(1)
@@ -552,7 +598,11 @@ with tab_approvals:
         st.markdown("#### Human Approvals")
         if human_approvals:
             df_app = pd.DataFrame(human_approvals)
-            cols_show = [c for c in ["approval_id", "decision_id", "action", "reviewer", "notes", "created_at"] if c in df_app.columns]
+            cols_show = [
+                c
+                for c in ["approval_id", "decision_id", "action", "reviewer", "notes", "created_at"]
+                if c in df_app.columns
+            ]
             st.dataframe(df_app[cols_show], use_container_width=True, hide_index=True)
         else:
             st.info("No human approvals recorded yet.")
@@ -572,11 +622,15 @@ with tab_approvals:
 # -------------------------------------------------------------
 with tab_benchmarks:
     st.markdown("### Automated Benchmark & Accuracy Console")
-    st.caption("Measured throughput, latency percentiles, and machine learning accuracy on 30 held-out evaluation transactions.")
+    st.caption(
+        "Measured throughput, latency percentiles, and machine learning accuracy on 30 held-out evaluation transactions."
+    )
 
     report_data = api_get("/evaluation-report") or {}
     if report_data.get("status") == "not_generated":
-        st.warning("⚠️ Benchmark evaluation report has not been generated yet. Run `python eval_benchmarks.py` or trigger from CLI.")
+        st.warning(
+            "⚠️ Benchmark evaluation report has not been generated yet. Run `python eval_benchmarks.py` or trigger from CLI."
+        )
     else:
         perf = report_data.get("performance_benchmarks", {})
         acc = report_data.get("accuracy_benchmarks", {})
@@ -584,37 +638,49 @@ with tab_benchmarks:
 
         col_b1, col_b2, col_b3, col_b4 = st.columns(4)
         with col_b1:
-            st.markdown(f"""
+            st.markdown(
+                f"""
             <div class="kpi-card">
                 <div class="kpi-title">Throughput</div>
-                <div class="kpi-value" style="color: #38bdf8;">{perf.get('records_per_second', 0.0):,.1f}</div>
+                <div class="kpi-value" style="color: #38bdf8;">{perf.get("records_per_second", 0.0):,.1f}</div>
                 <div class="kpi-sub">records / second</div>
             </div>
-            """, unsafe_allow_html=True)
+            """,
+                unsafe_allow_html=True,
+            )
         with col_b2:
-            st.markdown(f"""
+            st.markdown(
+                f"""
             <div class="kpi-card">
                 <div class="kpi-title">Latency (p50 / p95)</div>
-                <div class="kpi-value">{perf.get('p50_latency_ms', 0.0):.1f} <span style="font-size: 1rem; color: #94a3b8;">/ {perf.get('p95_latency_ms', 0.0):.1f}ms</span></div>
+                <div class="kpi-value">{perf.get("p50_latency_ms", 0.0):.1f} <span style="font-size: 1rem; color: #94a3b8;">/ {perf.get("p95_latency_ms", 0.0):.1f}ms</span></div>
                 <div class="kpi-sub">deterministic sweep latency</div>
             </div>
-            """, unsafe_allow_html=True)
+            """,
+                unsafe_allow_html=True,
+            )
         with col_b3:
-            st.markdown(f"""
+            st.markdown(
+                f"""
             <div class="kpi-card">
                 <div class="kpi-title">AI Held-Out Accuracy</div>
-                <div class="kpi-value" style="color: #34d399;">{acc.get('ai_agent_evaluation', {}).get('held_out_accuracy_percent', 0.0)}%</div>
+                <div class="kpi-value" style="color: #34d399;">{acc.get("ai_agent_evaluation", {}).get("held_out_accuracy_percent", 0.0)}%</div>
                 <div class="kpi-sub">on 30 held-out ground truth txns</div>
             </div>
-            """, unsafe_allow_html=True)
+            """,
+                unsafe_allow_html=True,
+            )
         with col_b4:
-            st.markdown(f"""
+            st.markdown(
+                f"""
             <div class="kpi-card">
                 <div class="kpi-title">Abstention Fidelity</div>
-                <div class="kpi-value" style="color: #34d399;">{acc.get('ai_agent_evaluation', {}).get('deliberate_abstention_fidelity_percent', 0.0)}%</div>
+                <div class="kpi-value" style="color: #34d399;">{acc.get("ai_agent_evaluation", {}).get("deliberate_abstention_fidelity_percent", 0.0)}%</div>
                 <div class="kpi-sub">zero hallucinated actions</div>
             </div>
-            """, unsafe_allow_html=True)
+            """,
+                unsafe_allow_html=True,
+            )
 
         st.markdown("---")
         col_m1, col_m2 = st.columns(2)

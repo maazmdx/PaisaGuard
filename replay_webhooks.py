@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-"""":
+""" ":
 exec python3 "$0" "$@"
 """
+
 """
 PaisaGuard Webhook Replayer
 Simulates live Razorpay webhook traffic against the PaisaGuard Ingestion Gateway.
@@ -13,16 +14,14 @@ Demonstrates:
   5. Atomic SQLite relational upserts.
 """
 
-import os
-import sys
-import json
-import hmac
-import hashlib
-import base64
 import argparse
-import urllib.request
+import base64
+import hashlib
+import hmac
+import json
+import os
 import urllib.error
-from datetime import datetime
+import urllib.request
 
 DEFAULT_GATEWAY_URL = "http://127.0.0.1:8001/webhooks/razorpay"
 WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "rzp_sec_buildathon_2026_demo")
@@ -39,8 +38,8 @@ SAMPLE_EVENTS = [
             "amount": 1500.00,
             "fee": 30.00,
             "tax": 5.40,
-            "payment_method": "upi"
-        }
+            "payment_method": "upi",
+        },
     },
     {
         "name": "Debit Card Settlement (Base64 Signature)",
@@ -53,8 +52,8 @@ SAMPLE_EVENTS = [
             "amount": 2450.00,
             "fee": 49.00,
             "tax": 8.82,
-            "payment_method": "card"
-        }
+            "payment_method": "card",
+        },
     },
     {
         "name": "Defensive Ingestion: Missing Fee & Tax (None)",
@@ -67,8 +66,8 @@ SAMPLE_EVENTS = [
             "amount": 899.00,
             "fee": None,
             "tax": None,
-            "payment_method": "netbanking"
-        }
+            "payment_method": "netbanking",
+        },
     },
     {
         "name": "Razorpay Native Nested Structure (Base64 Signature)",
@@ -84,11 +83,11 @@ SAMPLE_EVENTS = [
                         "amount": 350000,
                         "fee": 7000,
                         "tax": 1260,
-                        "method": "card"
+                        "method": "card",
                     }
                 }
-            }
-        }
+            },
+        },
     },
     {
         "name": "Tampered Payload / Man-in-the-Middle Attack (Expect 401 Rejection)",
@@ -101,14 +100,15 @@ SAMPLE_EVENTS = [
             "amount": 99999.00,
             "fee": 1.00,
             "tax": 0.18,
-            "payment_method": "upi"
-        }
-    }
+            "payment_method": "upi",
+        },
+    },
 ]
+
 
 def replay_event(event_info: dict, target_url: str):
     payload_bytes = json.dumps(event_info["payload"]).encode("utf-8")
-    
+
     # Generate signature
     hmac_obj = hmac.new(WEBHOOK_SECRET.encode("utf-8"), payload_bytes, hashlib.sha256)
     if event_info["encoding"] == "base64":
@@ -119,10 +119,7 @@ def replay_event(event_info: dict, target_url: str):
     if event_info.get("tamper", False):
         sig = "tampered_fake_signature_hash_0000000000"
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-Razorpay-Signature": sig
-    }
+    headers = {"Content-Type": "application/json", "X-Razorpay-Signature": sig}
 
     req = urllib.request.Request(target_url, data=payload_bytes, headers=headers, method="POST")
     try:
@@ -135,6 +132,7 @@ def replay_event(event_info: dict, target_url: str):
         return e.code, body
     except Exception as e:
         return 0, {"error": str(e)}
+
 
 def main():
     parser = argparse.ArgumentParser(description="PaisaGuard Synthetic Webhook Replayer")
@@ -151,7 +149,7 @@ def main():
     for i, event in enumerate(SAMPLE_EVENTS, start=1):
         print(f"\n[{i}/{len(SAMPLE_EVENTS)}] Simulating: {event['name']}...")
         status_code, body = replay_event(event, args.url)
-        
+
         if status_code == 200:
             print(f"  Result : \033[92mHTTP {status_code} OK\033[0m")
             print(f"  Details: Payment ID: {body.get('payment_id')} | HMAC Verified: {body.get('hmac_verified')}")
@@ -165,6 +163,7 @@ def main():
     print("\n" + "=" * 75)
     print("Replay simulation completed successfully.")
     print("=" * 75)
+
 
 if __name__ == "__main__":
     main()

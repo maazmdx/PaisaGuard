@@ -25,120 +25,56 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Database Initialization & Synthetic Data Ingestion
+    - name: Code Quality & Linting
+      run: |
+        ruff check .
+
+    - name: Database Initialization & Synthetic Data Seeding
       env:
         GIT_SHA: ${{ github.sha }}
       run: |
-        python seed_data.py
+        python seed_data.py --reset
 
-    - name: Execute Automated Test Suite (Unittest)
-      run: |
-        python -m unittest test_reconciliation.py
-
-    - name: Execute Full Pytest Harness
+    - name: Execute Full Pytest Harness (39 Tests)
       run: |
         pytest -v
 
-    - name: Run Reconciliation Matching Engine Pipeline
+    - name: Run Reconciliation Benchmark & Accuracy Evaluation
       env:
         GIT_SHA: ${{ github.sha }}
-      run: |
-        python recon_engine.py
-
-    - name: Verify Reconciled Outputs Exist
-      run: |
-        if [ ! -f out/final-matched-ledger.csv ]; then
-          echo "Error: matched ledger output missing!"
-          exit 1
-        fi
-        if [ ! -f out/final-exception-queue.csv ]; then
-          echo "Error: exception queue output missing!"
-          exit 1
-        fi
-        if [ ! -f out/monthly-tax-audit-report.json ]; then
-          echo "Error: monthly GST audit report missing!"
-          exit 1
-        fi
-        echo "Reconcile pipeline verified successfully!"
-
-    - name: Execute Adversarial Concurrency Benchmark (CI-Sized: 50 threads)
-      env:
         PAISAGUARD_CI: "1"
-        GIT_SHA: ${{ github.sha }}
       run: |
-        python concurrency_tester.py
-        if [ ! -f out/concurrency-benchmark.json ]; then
-          echo "Error: concurrency benchmark output missing!"
-          exit 1
-        fi
-        echo "--- Benchmark Summary ---"
-        python -c "import json; d=json.load(open('out/concurrency-benchmark.json')); print(f\"WAL lock_errors={d['wal_mode']['lock_errors']} successful={d['wal_mode']['successful_commits']} verdict={d['verdict']}\")"
+        python eval_benchmarks.py
 
-    - name: Generate CI Benchmark Provenance Manifest
-      env:
-        GIT_SHA: ${{ github.sha }}
-        GITHUB_RUN_ID: ${{ github.run_id }}
-        GITHUB_REF: ${{ github.ref }}
-        RUNNER_OS: ${{ runner.os }}
-        RUNNER_ARCH: ${{ runner.arch }}
+    - name: Verify Reconciled Outputs & Reports Exist
       run: |
-        python -c "
-        import os, sys, platform, sqlite3, json, time
+        for file in out/final-matched-ledger.csv out/final-exception-queue.csv out/recon-run-summary.json out/evaluation-report.json out/evaluation-report.md; do
+          if [ ! -f "$file" ]; then
+            echo "Error: Required artifact $file is missing!"
+            exit 1
+          fi
+        done
+        echo "All reconciliation outputs and evaluation reports verified successfully!"
 
-        concurrency_data = {}
-        if os.path.exists('out/concurrency-benchmark.json'):
-            with open('out/concurrency-benchmark.json') as f:
-                concurrency_data = json.load(f)
-
-        tax_report_data = {}
-        if os.path.exists('out/monthly-tax-audit-report.json'):
-            with open('out/monthly-tax-audit-report.json') as f:
-                tax_report_data = json.load(f)
-
-        provenance = {
-            'provenance_schema_version': '1.0',
-            'generated_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
-            'ci_environment': {
-                'runner_os': os.environ.get('RUNNER_OS', 'Linux'),
-                'runner_arch': os.environ.get('RUNNER_ARCH', 'X64'),
-                'platform': platform.platform(),
-                'cpu_count': os.cpu_count(),
-                'python_version': sys.version.split()[0],
-                'sqlite_version': sqlite3.sqlite_version,
-                'github_run_id': os.environ.get('GITHUB_RUN_ID', 'local'),
-                'github_ref': os.environ.get('GITHUB_REF', 'local'),
-                'git_sha': os.environ.get('GIT_SHA', 'local')
-            },
-            'benchmark_metrics': {
-                'wal_throughput_tps': concurrency_data.get('wal_mode', {}).get('throughput_tps'),
-                'wal_lock_errors': concurrency_data.get('wal_mode', {}).get('lock_errors', 0),
-                'wal_successful_commits': concurrency_data.get('wal_mode', {}).get('successful_commits', 0),
-                'rollback_lock_errors': concurrency_data.get('rollback_journal_mode', {}).get('lock_errors', 0),
-                'verdict': concurrency_data.get('verdict', 'VERIFIED')
-            },
-            'tax_audit_reconciliation': {
-                'run_id': tax_report_data.get('run_id'),
-                'seed_hash': tax_report_data.get('seed_hash'),
-                'detected_tax_leakage': tax_report_data.get('detected_tax_leakage')
-            }
-        }
-
-        with open('out/ci-benchmark-provenance.json', 'w') as f:
-            json.dump(provenance, f, indent=2)
-        print('Provenance written to out/ci-benchmark-provenance.json')
-        "
-
-    - name: Upload Reconciled Audit Artifacts
+    - name: Upload Reconciled Audit & Benchmark Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: paisaguard-audit-artifacts
+        name: paisaguard-benchmark-artifacts
         path: out/
 
-    - name: Print Artifact Manifest
+    - name: Print Benchmark Summary
       run: |
-        echo "=== Artifacts produced ==="
-        ls -lh out/
-        echo "=== Tax Audit Provenance ==="
-        python -c "import json; d=json.load(open('out/monthly-tax-audit-report.json')); print(f\"run_id={d.get('run_id')} git_sha={d.get('git_sha')} seed_hash={d.get('seed_hash')} leakage=INR{d['detected_tax_leakage']}\")"
-        echo "=== Benchmark Provenance ==="
-        python -c "import json; d=json.load(open('out/ci-benchmark-provenance.json')); print(f\"Runner CPU: {d['ci_environment']['cpu_count']} cores | Python: {d['ci_environment']['python_version']} | WAL commits: {d['benchmark_metrics']['wal_successful_commits']} (0 errors)\")"
+        echo "=== PaisaGuard Benchmark Summary ==="
+        python -c "
+        import json
+        with open('out/evaluation-report.json') as f:
+            d = json.load(f)
+        p = d.get('performance_benchmarks', {})
+        a = d.get('accuracy_benchmarks', {})
+        dm = a.get('deterministic_matcher', {})
+        ai = a.get('ai_agent_evaluation', {})
+        print(f\"Throughput: {p.get('records_per_second', 0):.2f} rec/s (p50: {p.get('p50_latency_ms', 0):.2f}ms, p95: {p.get('p95_latency_ms', 0):.2f}ms)\")
+        print(f\"Matcher: Coverage={dm.get('coverage_percent')}% Precision={dm.get('precision_percent')}% Recall={dm.get('recall_percent')}%\")
+        print(f\"AI Agent: Accuracy={ai.get('held_out_accuracy_percent')}% Abstention Fidelity={ai.get('deliberate_abstention_fidelity_percent')}%\")
+        print(f\"Final Resolution Accuracy: {a.get('final_resolution_accuracy', {}).get('resolution_accuracy_percent')}%\")
+        "

@@ -8,8 +8,8 @@ Creates:
 - Polymorphic subjects: BUSINESS_TX, PAYOUT, and BANK_CREDIT.
 """
 
-import json
 import hashlib
+import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,7 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from money import parse_inr_to_paise, calc_mdr_fee_and_tax_paise
+from money import calc_mdr_fee_and_tax_paise, parse_inr_to_paise
 
 MANIFEST_PATH = BASE_DIR / "fixtures" / "ground_truth_manifest.json"
 
@@ -33,18 +33,26 @@ def build_manifest():
         "description": "Checked-in ground-truth manifest for PaisaGuard 3-Source Reconciliation",
         "generated_at": "2026-08-01T00:00:00Z",
         "contracts": {
-            "standard_mdr_bps": 200,      # 2.00%
-            "standard_gst_bps": 1800,     # 18.00% on fee
-            "corporate_mdr_bps": 250,     # 2.50%
-            "corporate_gst_bps": 1800
+            "standard_mdr_bps": 200,  # 2.00%
+            "standard_gst_bps": 1800,  # 18.00% on fee
+            "corporate_mdr_bps": 250,  # 2.50%
+            "corporate_gst_bps": 1800,
         },
-        "transactions": []
+        "transactions": [],
     }
 
     base_time = datetime(2026, 8, 1, 9, 0, 0)
     sample_amounts = [
-        "499.00", "899.00", "1299.50", "1499.00", "2499.00",
-        "3999.00", "5490.00", "7999.00", "999.00", "1599.00"
+        "499.00",
+        "899.00",
+        "1299.50",
+        "1499.00",
+        "2499.00",
+        "3999.00",
+        "5490.00",
+        "7999.00",
+        "999.00",
+        "1599.00",
     ]
 
     payout_groups = {}  # payout_id -> list of settlement records
@@ -174,7 +182,7 @@ def build_manifest():
                 "customer_id": customer_id,
                 "source_payload_hash": sha256_hash(oms_raw),
                 "created_at": created_time,
-                "status": "created"
+                "status": "created",
             }
 
         settle_record = None
@@ -194,7 +202,7 @@ def build_manifest():
                 "payment_method": payment_method,
                 "source_payload_hash": sha256_hash(settle_raw),
                 "settled_at": settled_time,
-                "status": "settled"
+                "status": "settled",
             }
             webhook_raw = f"event_id:{event_id}:pay_id:{payment_id}:amt:{settle_amt}"
             webhook_record = {
@@ -204,7 +212,7 @@ def build_manifest():
                 "payload_json": json.dumps(settle_record),
                 "hmac_signature": "sha256:valid_fixture_hmac",
                 "received_at": settled_time,
-                "status": "processed"
+                "status": "processed",
             }
             if payout_rel:
                 payout_groups.setdefault(payout_rel, []).append(settle_record)
@@ -215,21 +223,23 @@ def build_manifest():
         if settle_record:
             associated_ids.append(settle_record["payment_id"])
 
-        manifest["transactions"].append({
-            "subject_type": "BUSINESS_TX",
-            "subject_id": tx_id,
-            "business_tx_id": tx_id,
-            "is_held_out": False,
-            "expected_reconciliation_status": expected_status,
-            "expected_root_cause": expected_root_cause,
-            "payout_relationship": payout_rel,
-            "should_abstain": should_abstain,
-            "expected_final_disposition": expected_disposition,
-            "associated_record_ids": associated_ids,
-            "oms_order": oms_record,
-            "settlement": settle_record,
-            "webhook_event": webhook_record
-        })
+        manifest["transactions"].append(
+            {
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "business_tx_id": tx_id,
+                "is_held_out": False,
+                "expected_reconciliation_status": expected_status,
+                "expected_root_cause": expected_root_cause,
+                "payout_relationship": payout_rel,
+                "should_abstain": should_abstain,
+                "expected_final_disposition": expected_disposition,
+                "associated_record_ids": associated_ids,
+                "oms_order": oms_record,
+                "settlement": settle_record,
+                "webhook_event": webhook_record,
+            }
+        )
 
     # -------------------------------------------------------------
     # 2. Operational Unmatched Bank Credits (subject_type: BANK_CREDIT)
@@ -244,7 +254,7 @@ def build_manifest():
             "account_tail": "9421",
             "status": "credited",
             "expected_root_cause": "UNIDENTIFIED_DIRECT_CREDIT",
-            "expected_final_disposition": "ESCALATE_TO_BANK_OPS"
+            "expected_final_disposition": "ESCALATE_TO_BANK_OPS",
         },
         {
             "credit_id": "bank_cr_unmatched_02",
@@ -255,8 +265,8 @@ def build_manifest():
             "account_tail": "9421",
             "status": "credited",
             "expected_root_cause": "UNIDENTIFIED_DIRECT_CREDIT",
-            "expected_final_disposition": "ESCALATE_TO_BANK_OPS"
-        }
+            "expected_final_disposition": "ESCALATE_TO_BANK_OPS",
+        },
     ]
     for ubc in unmatched_bank_credits:
         credit_raw = f"credit_id:{ubc['credit_id']}:amt:{ubc['credit_amount_paise']}:utr:{ubc['utr_number']}"
@@ -268,21 +278,23 @@ def build_manifest():
             "source_payload_hash": sha256_hash(credit_raw),
             "credited_at": ubc["credited_at"],
             "account_tail": ubc["account_tail"],
-            "status": ubc["status"]
+            "status": ubc["status"],
         }
-        manifest["transactions"].append({
-            "subject_type": "BANK_CREDIT",
-            "subject_id": ubc["credit_id"],
-            "business_tx_id": None,
-            "is_held_out": False,
-            "expected_reconciliation_status": "UNMATCHED_BANK_CREDIT",
-            "expected_root_cause": ubc["expected_root_cause"],
-            "payout_relationship": None,
-            "should_abstain": False,
-            "expected_final_disposition": ubc["expected_final_disposition"],
-            "associated_record_ids": [ubc["credit_id"]],
-            "bank_credit": ubc_record
-        })
+        manifest["transactions"].append(
+            {
+                "subject_type": "BANK_CREDIT",
+                "subject_id": ubc["credit_id"],
+                "business_tx_id": None,
+                "is_held_out": False,
+                "expected_reconciliation_status": "UNMATCHED_BANK_CREDIT",
+                "expected_root_cause": ubc["expected_root_cause"],
+                "payout_relationship": None,
+                "should_abstain": False,
+                "expected_final_disposition": ubc["expected_final_disposition"],
+                "associated_record_ids": [ubc["credit_id"]],
+                "bank_credit": ubc_record,
+            }
+        )
 
     # -------------------------------------------------------------
     # 3. Operational Bank Payout Credits (matched to payout_groups)
@@ -309,22 +321,24 @@ def build_manifest():
             "source_payload_hash": sha256_hash(cr_raw),
             "credited_at": cr_time,
             "account_tail": "9421",
-            "status": "credited"
+            "status": "credited",
         }
         manifest["bank_payout_credits"].append(cr_rec)
 
     for ubc in unmatched_bank_credits:
         credit_raw = f"credit_id:{ubc['credit_id']}:amt:{ubc['credit_amount_paise']}:utr:{ubc['utr_number']}"
-        manifest["bank_payout_credits"].append({
-            "credit_id": ubc["credit_id"],
-            "payout_id": None,
-            "utr_number": ubc["utr_number"],
-            "credit_amount_paise": ubc["credit_amount_paise"],
-            "source_payload_hash": sha256_hash(credit_raw),
-            "credited_at": ubc["credited_at"],
-            "account_tail": ubc["account_tail"],
-            "status": ubc["status"]
-        })
+        manifest["bank_payout_credits"].append(
+            {
+                "credit_id": ubc["credit_id"],
+                "payout_id": None,
+                "utr_number": ubc["utr_number"],
+                "credit_amount_paise": ubc["credit_amount_paise"],
+                "source_payload_hash": sha256_hash(credit_raw),
+                "credited_at": ubc["credited_at"],
+                "account_tail": ubc["account_tail"],
+                "status": ubc["status"],
+            }
+        )
 
     # -------------------------------------------------------------
     # 4. Held-Out Evaluation Transactions: 30 Business Transactions
@@ -448,7 +462,7 @@ def build_manifest():
                 "customer_id": customer_id,
                 "source_payload_hash": sha256_hash(oms_raw),
                 "created_at": created_time,
-                "status": "created"
+                "status": "created",
             }
 
         settle_rec = None
@@ -468,7 +482,7 @@ def build_manifest():
                 "payment_method": method,
                 "source_payload_hash": sha256_hash(settle_raw),
                 "settled_at": settled_time,
-                "status": "settled"
+                "status": "settled",
             }
             webhook_raw = f"event_id:{event_id}:pay_id:{payment_id}:amt:{settle_p}"
             webhook_rec = {
@@ -478,7 +492,7 @@ def build_manifest():
                 "payload_json": json.dumps(settle_rec),
                 "hmac_signature": "sha256:valid_eval_hmac",
                 "received_at": settled_time,
-                "status": "processed"
+                "status": "processed",
             }
 
         assoc_ids = []
@@ -487,21 +501,23 @@ def build_manifest():
         if settle_rec:
             assoc_ids.append(settle_rec["payment_id"])
 
-        manifest["transactions"].append({
-            "subject_type": "BUSINESS_TX",
-            "subject_id": tx_id,
-            "business_tx_id": tx_id,
-            "is_held_out": True,
-            "expected_reconciliation_status": exp_status,
-            "expected_root_cause": exp_cause,
-            "payout_relationship": payout_id,
-            "should_abstain": abstain,
-            "expected_final_disposition": exp_disp,
-            "associated_record_ids": assoc_ids,
-            "oms_order": oms_rec,
-            "settlement": settle_rec,
-            "webhook_event": webhook_rec
-        })
+        manifest["transactions"].append(
+            {
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "business_tx_id": tx_id,
+                "is_held_out": True,
+                "expected_reconciliation_status": exp_status,
+                "expected_root_cause": exp_cause,
+                "payout_relationship": payout_id,
+                "should_abstain": abstain,
+                "expected_final_disposition": exp_disp,
+                "associated_record_ids": assoc_ids,
+                "oms_order": oms_rec,
+                "settlement": settle_rec,
+                "webhook_event": webhook_rec,
+            }
+        )
 
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MANIFEST_PATH, "w", encoding="utf-8") as f:

@@ -9,8 +9,8 @@ Architectural Rule:
 - calc_mdr_fee_and_tax_paise(): Pure integer paise MDR and GST calculations with commercial rounding.
 """
 
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Union, Any, Tuple
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, Tuple, Union
 
 TWO_PLACES = Decimal("0.01")
 
@@ -19,7 +19,7 @@ def parse_inr_to_paise(val: Union[str, Decimal]) -> int:
     """
     Parses a human or fixture INR string or Decimal to exact integer paise.
     e.g. "1499.50" -> 149950 paise.
-    
+
     SAFETY CONSTRAINT:
     Strictly rejects raw integer amounts to eliminate ambiguity between integer rupees and integer paise.
     """
@@ -77,8 +77,8 @@ def format_paise_inr(paise: int) -> str:
 
 def calc_mdr_fee_and_tax_paise(
     gross_paise: int,
-    mdr_bps: int = 200,      # Default 2.00% MDR = 200 basis points
-    gst_bps: int = 1800      # Default 18.00% GST on fee = 1800 basis points
+    mdr_bps: int = 200,  # Default 2.00% MDR = 200 basis points
+    gst_bps: int = 1800,  # Default 18.00% GST on fee = 1800 basis points
 ) -> Tuple[int, int]:
     """
     Computes exact contracted MDR fee and GST tax on fee in canonical integer paise.

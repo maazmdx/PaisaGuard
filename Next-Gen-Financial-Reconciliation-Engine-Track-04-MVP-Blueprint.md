@@ -176,9 +176,9 @@ PaisaGuard isolates LLMs behind strict economic and programmatic boundaries. The
 ```python
 class AIDiagnosticResponse(BaseModel):
     is_legitimate_variance: bool
-    root_cause_classification: str # "CARD_NETWORK_SURCHARGE", "GATEWAY_ROUNDING", "CURRENCY_CONVERSION"
-    suggested_action: str          # "APPROVE_OVERRIDE", "ESCALATE_DISPUTE"
-    confidence_score: float        # Range 0.0 to 1.0
+    root_cause_classification: str  # "CARD_NETWORK_SURCHARGE", "GATEWAY_ROUNDING", "CURRENCY_CONVERSION"
+    suggested_action: str  # "APPROVE_OVERRIDE", "ESCALATE_DISPUTE"
+    confidence_score: float  # Range 0.0 to 1.0
     technical_rationale: str
 ```
 

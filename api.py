@@ -20,18 +20,19 @@ Architectural Guarantees:
      allowing the Streamlit dashboard to operate with zero direct SQLite volume access.
 """
 
+import base64
+import hashlib
+import hmac
+import json
+import logging
 import os
 import sys
-import hmac
-import hashlib
-import base64
-import json
 import time
-import logging
-from typing import Dict, Any, Optional, Tuple, List
 from collections import defaultdict
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Header, Request, Response, Depends, status
+from typing import Optional, Tuple
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,29 +40,33 @@ OUT_DIR = BASE_DIR / "out"
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from db import get_db_connection, get_db_cursor, get_db_path, log_audit_event
-from recon_engine import execute_reconciliation_pipeline
-from exception_agent import investigate_exception
 from audit_service import record_human_approval
-from money import require_paise, paise_to_rupees, format_paise_inr
+from db import get_db_connection, get_db_cursor
+from exception_agent import investigate_exception
+from money import format_paise_inr, require_paise
+from recon_engine import execute_reconciliation_pipeline
 
 # Configure Structured JSON Logging without secret leakage
 logging.basicConfig(
     level=logging.INFO,
-    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"paisaguard-api","message":%(message)s}'
+    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"paisaguard-api","message":%(message)s}',
 )
 logger = logging.getLogger("paisaguard.gateway")
 
 app = FastAPI(
     title="PaisaGuard FinOps Engine",
     description="3-Source Financial Reconciliation, HMAC Ingestion & AI Diagnostic Controller",
-    version="3.0.0"
+    version="3.0.0",
 )
 
 # Security Configuration
 ENVIRONMENT = os.environ.get("PAISAGUARD_ENV", "development").lower()
 PAISAGUARD_API_TOKEN = os.environ.get("PAISAGUARD_API_TOKEN", "")
-PAISAGUARD_DEMO_ALLOW_UNSIGNED = os.environ.get("PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS", "false").lower() in ("1", "true", "yes")
+PAISAGUARD_DEMO_ALLOW_UNSIGNED = os.environ.get("PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
 
@@ -95,14 +100,14 @@ def verify_api_token(x_paisaguard_token: Optional[str] = Header(None)):
         logger.error('{"event":"auth_rejection","reason":"server_token_unset"}')
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="FinOps Security Policy: Server PAISAGUARD_API_TOKEN is not configured. Protected write actions are disabled."
+            detail="FinOps Security Policy: Server PAISAGUARD_API_TOKEN is not configured. Protected write actions are disabled.",
         )
 
     if not x_paisaguard_token or not hmac.compare_digest(x_paisaguard_token, expected_token):
         logger.warning('{"event":"auth_rejection","reason":"invalid_or_missing_token"}')
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Valid X-PaisaGuard-Token header is required for this operation."
+            detail="Unauthorized: Valid X-PaisaGuard-Token header is required for this operation.",
         )
 
 
@@ -148,9 +153,15 @@ class RazorpayWebhookPayload(BaseModel):
     payment_id: str = Field(..., json_schema_extra={"example": "pay_rzp_9901"})
     order_id: Optional[str] = Field(None, json_schema_extra={"example": "ord_in_1050"})
     payout_id: Optional[str] = Field(None, json_schema_extra={"example": "payout_aug_01"})
-    amount_paise: int = Field(..., description="Payment amount in canonical integer paise", json_schema_extra={"example": 150000})
-    fee_paise: Optional[int] = Field(0, description="Deducted gateway fee in integer paise", json_schema_extra={"example": 3000})
-    tax_paise: Optional[int] = Field(0, description="Deducted GST tax in integer paise", json_schema_extra={"example": 540})
+    amount_paise: int = Field(
+        ..., description="Payment amount in canonical integer paise", json_schema_extra={"example": 150000}
+    )
+    fee_paise: Optional[int] = Field(
+        0, description="Deducted gateway fee in integer paise", json_schema_extra={"example": 3000}
+    )
+    tax_paise: Optional[int] = Field(
+        0, description="Deducted GST tax in integer paise", json_schema_extra={"example": 540}
+    )
     payment_method: Optional[str] = Field("upi", json_schema_extra={"example": "upi"})
 
 
@@ -179,8 +190,8 @@ def root():
         "security_policy": {
             "token_configured": has_token,
             "hmac_secret_configured": has_secret,
-            "demo_unsigned_allowed": PAISAGUARD_DEMO_ALLOW_UNSIGNED
-        }
+            "demo_unsigned_allowed": PAISAGUARD_DEMO_ALLOW_UNSIGNED,
+        },
     }
 
 
@@ -188,7 +199,7 @@ def root():
 async def ingest_webhook(
     request: Request,
     x_razorpay_signature: Optional[str] = Header(None),
-    x_razorpay_event_id: Optional[str] = Header(None)
+    x_razorpay_event_id: Optional[str] = Header(None),
 ):
     """
     Production-grade webhook ingestion:
@@ -201,8 +212,7 @@ async def ingest_webhook(
     allowed, _ = rate_limiter.is_allowed(client_ip)
     if not allowed:
         raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded: 200 requests/min ceiling."
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded: 200 requests/min ceiling."
         )
 
     raw_body = await request.body()
@@ -214,7 +224,7 @@ async def ingest_webhook(
             logger.error('{"event":"hmac_rejected","reason":"missing_signature"}')
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Security Violation: Missing X-Razorpay-Signature header. Unsigned webhooks are rejected by default."
+                detail="Security Violation: Missing X-Razorpay-Signature header. Unsigned webhooks are rejected by default.",
             )
         else:
             logger.warning('{"event":"hmac_notice","reason":"unsigned_payload_permitted_under_demo_flag"}')
@@ -223,20 +233,20 @@ async def ingest_webhook(
             logger.error('{"event":"hmac_rejected","reason":"server_webhook_secret_missing"}')
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="FinOps Security Policy: RAZORPAY_WEBHOOK_SECRET is not configured on server."
+                detail="FinOps Security Policy: RAZORPAY_WEBHOOK_SECRET is not configured on server.",
             )
         verified, _ = verify_webhook_signature(raw_body, x_razorpay_signature, webhook_secret)
         if not verified:
             logger.error('{"event":"hmac_rejected","reason":"invalid_signature"}')
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="HMAC verification failed: Signature does not match payload content."
+                detail="HMAC verification failed: Signature does not match payload content.",
             )
 
     # Parse and Validate Payload
     try:
         body_json = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-        
+
         # Support native Razorpay nested entity structure or flat payload
         if "payload" in body_json and "payment" in body_json["payload"]:
             entity = body_json["payload"]["payment"].get("entity", {})
@@ -250,7 +260,7 @@ async def ingest_webhook(
                 amount_paise=require_paise(int(entity.get("amount", 0))),
                 fee_paise=require_paise(int(entity.get("fee", 0))),
                 tax_paise=require_paise(int(entity.get("tax", 0))),
-                payment_method=entity.get("method", "upi")
+                payment_method=entity.get("method", "upi"),
             )
         else:
             if x_razorpay_event_id and "event_id" not in body_json:
@@ -273,25 +283,29 @@ async def ingest_webhook(
                 "status": "duplicate_ignored",
                 "event_id": payload.event_id,
                 "payment_id": payload.payment_id,
-                "message": "Event ID already recorded; deduplicated without state mutation."
+                "message": "Event ID already recorded; deduplicated without state mutation.",
             }
 
         # Record in webhook_events
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO webhook_events (
                 event_id, payment_id, source_payload_hash, payload_json, hmac_signature, received_at, status
             ) VALUES (?, ?, ?, ?, ?, ?, 'processed');
-        """, (
-            payload.event_id,
-            payload.payment_id,
-            source_payload_hash,
-            json.dumps(payload.model_dump()),
-            x_razorpay_signature or "none",
-            now_ts
-        ))
+        """,
+            (
+                payload.event_id,
+                payload.payment_id,
+                source_payload_hash,
+                json.dumps(payload.model_dump()),
+                x_razorpay_signature or "none",
+                now_ts,
+            ),
+        )
 
         # Atomic Upsert into razorpay_settlements
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO razorpay_settlements (
                 payment_id, business_tx_id, order_id, payout_id, amount_paise,
                 fee_paise, tax_paise, net_paise, currency, payment_method,
@@ -305,30 +319,33 @@ async def ingest_webhook(
                 tax_paise = excluded.tax_paise,
                 net_paise = excluded.net_paise,
                 status = excluded.status;
-        """, (
-            payload.payment_id,
-            f"tx_live_{payload.payment_id}",
-            payload.order_id,
-            payload.payout_id,
-            payload.amount_paise,
-            payload.fee_paise,
-            payload.tax_paise,
-            net_paise,
-            payload.payment_method or "upi",
-            source_payload_hash,
-            now_ts
-        ))
+        """,
+            (
+                payload.payment_id,
+                f"tx_live_{payload.payment_id}",
+                payload.order_id,
+                payload.payout_id,
+                payload.amount_paise,
+                payload.fee_paise,
+                payload.tax_paise,
+                net_paise,
+                payload.payment_method or "upi",
+                source_payload_hash,
+                now_ts,
+            ),
+        )
 
-    logger.info('{"event":"webhook_ingested","event_id":"%s","payment_id":"%s","amount_paise":%d}' % (
-        payload.event_id, payload.payment_id, payload.amount_paise
-    ))
+    logger.info(
+        '{"event":"webhook_ingested","event_id":"%s","payment_id":"%s","amount_paise":%d}'
+        % (payload.event_id, payload.payment_id, payload.amount_paise)
+    )
 
     return {
         "status": "ingested",
         "event_id": payload.event_id,
         "payment_id": payload.payment_id,
         "amount_paise": payload.amount_paise,
-        "hmac_verified": bool(x_razorpay_signature)
+        "hmac_verified": bool(x_razorpay_signature),
     }
 
 
@@ -366,14 +383,14 @@ def submit_human_approval(req: HumanApprovalRequest):
             action=req.action,
             reviewer=req.reviewer,
             notes=req.notes,
-            investigation_id=req.investigation_id
+            investigation_id=req.investigation_id,
         )
         return {
             "status": "approval_recorded",
             "approval_id": approval_id,
             "decision_id": req.decision_id,
             "action": req.action,
-            "reviewer": req.reviewer
+            "reviewer": req.reviewer,
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -392,7 +409,9 @@ def get_metrics():
         total_settle = conn.execute("SELECT COUNT(*) FROM razorpay_settlements").fetchone()[0]
         total_bank_cr = conn.execute("SELECT COUNT(*) FROM bank_payout_credits").fetchone()[0]
 
-        total_volume_paise = conn.execute("SELECT COALESCE(SUM(amount_paise), 0) FROM razorpay_settlements").fetchone()[0]
+        total_volume_paise = conn.execute("SELECT COALESCE(SUM(amount_paise), 0) FROM razorpay_settlements").fetchone()[
+            0
+        ]
 
         # Decisions from projection view
         matched_tx = conn.execute(
@@ -412,9 +431,7 @@ def get_metrics():
         unresolved_count = conn.execute(
             "SELECT COUNT(*) FROM v_current_decisions WHERE current_disposition = 'UNRESOLVED' AND match_status = 'EXCEPTION'"
         ).fetchone()[0]
-        approved_count = conn.execute(
-            "SELECT COUNT(*) FROM human_approvals"
-        ).fetchone()[0]
+        approved_count = conn.execute("SELECT COUNT(*) FROM human_approvals").fetchone()[0]
 
         total_tx = matched_tx + exception_tx
         total_p = matched_payouts + exception_payouts
@@ -425,25 +442,22 @@ def get_metrics():
                 "settlements": total_settle,
                 "bank_credits": total_bank_cr,
                 "total_volume_paise": total_volume_paise,
-                "total_volume_inr": format_paise_inr(total_volume_paise)
+                "total_volume_inr": format_paise_inr(total_volume_paise),
             },
             "transaction_metrics": {
                 "total_transactions": total_tx,
                 "matched_count": matched_tx,
                 "exception_count": exception_tx,
                 "match_rate_percent": round((matched_tx / total_tx) * 100, 2) if total_tx > 0 else 0.0,
-                "unresolved_count": unresolved_count
+                "unresolved_count": unresolved_count,
             },
             "payout_metrics": {
                 "total_payout_batches": total_p,
                 "matched_count": matched_payouts,
                 "exception_count": exception_payouts,
-                "match_rate_percent": round((matched_payouts / total_p) * 100, 2) if total_p > 0 else 0.0
+                "match_rate_percent": round((matched_payouts / total_p) * 100, 2) if total_p > 0 else 0.0,
             },
-            "governance": {
-                "unresolved_exceptions": unresolved_count,
-                "human_approvals_recorded": approved_count
-            }
+            "governance": {"unresolved_exceptions": unresolved_count, "human_approvals_recorded": approved_count},
         }
     finally:
         conn.close()
@@ -455,7 +469,7 @@ def get_payouts():
     conn = get_db_connection()
     try:
         payout_rows = conn.execute("""
-            SELECT 
+            SELECT
                 s.payout_id,
                 COUNT(s.payment_id) as settlement_count,
                 SUM(s.amount_paise) as gross_paise,
@@ -491,29 +505,33 @@ def get_payouts():
             else:
                 status_label = "BANK_MISMATCH"
 
-            payouts_data.append({
-                "payout_id": r["payout_id"],
-                "settlement_count": r["settlement_count"],
-                "gross_paise": r["gross_paise"],
-                "net_paise": net_p,
-                "net_inr": format_paise_inr(net_p),
-                "credit_id": r["credit_id"],
-                "utr_number": r["utr_number"],
-                "bank_amount_paise": bank_p,
-                "bank_amount_inr": format_paise_inr(bank_p) if bank_p is not None else "Pending",
-                "status": status_label
-            })
+            payouts_data.append(
+                {
+                    "payout_id": r["payout_id"],
+                    "settlement_count": r["settlement_count"],
+                    "gross_paise": r["gross_paise"],
+                    "net_paise": net_p,
+                    "net_inr": format_paise_inr(net_p),
+                    "credit_id": r["credit_id"],
+                    "utr_number": r["utr_number"],
+                    "bank_amount_paise": bank_p,
+                    "bank_amount_inr": format_paise_inr(bank_p) if bank_p is not None else "Pending",
+                    "status": status_label,
+                }
+            )
 
         direct_data = []
         for d in direct_credits:
-            direct_data.append({
-                "credit_id": d["credit_id"],
-                "utr_number": d["utr_number"],
-                "credit_amount_paise": d["credit_amount_paise"],
-                "credit_amount_inr": format_paise_inr(d["credit_amount_paise"]),
-                "credited_at": d["credited_at"],
-                "status": "UNMATCHED_DIRECT_CREDIT"
-            })
+            direct_data.append(
+                {
+                    "credit_id": d["credit_id"],
+                    "utr_number": d["utr_number"],
+                    "credit_amount_paise": d["credit_amount_paise"],
+                    "credit_amount_inr": format_paise_inr(d["credit_amount_paise"]),
+                    "credited_at": d["credited_at"],
+                    "status": "UNMATCHED_DIRECT_CREDIT",
+                }
+            )
 
         return {"payout_batches": payouts_data, "unmatched_bank_credits": direct_data}
     finally:
@@ -526,7 +544,7 @@ def get_exceptions():
     conn = get_db_connection()
     try:
         rows = conn.execute("""
-            SELECT 
+            SELECT
                 d.decision_id,
                 d.subject_type,
                 d.subject_id,
@@ -547,22 +565,24 @@ def get_exceptions():
 
         exceptions_list = []
         for r in rows:
-            exceptions_list.append({
-                "decision_id": r["decision_id"],
-                "subject_type": r["subject_type"],
-                "subject_id": r["subject_id"],
-                "business_tx_id": r["business_tx_id"],
-                "order_id": r["order_id"],
-                "payment_id": r["payment_id"],
-                "payout_id": r["payout_id"],
-                "credit_id": r["credit_id"],
-                "discrepancy_code": r["discrepancy_code"],
-                "variance_paise": r["variance_paise"],
-                "variance_inr": format_paise_inr(r["variance_paise"]),
-                "evidence": json.loads(r["evidence_json"]) if r["evidence_json"] else {},
-                "current_disposition": r["current_disposition"],
-                "created_at": r["decision_created_at"]
-            })
+            exceptions_list.append(
+                {
+                    "decision_id": r["decision_id"],
+                    "subject_type": r["subject_type"],
+                    "subject_id": r["subject_id"],
+                    "business_tx_id": r["business_tx_id"],
+                    "order_id": r["order_id"],
+                    "payment_id": r["payment_id"],
+                    "payout_id": r["payout_id"],
+                    "credit_id": r["credit_id"],
+                    "discrepancy_code": r["discrepancy_code"],
+                    "variance_paise": r["variance_paise"],
+                    "variance_inr": format_paise_inr(r["variance_paise"]),
+                    "evidence": json.loads(r["evidence_json"]) if r["evidence_json"] else {},
+                    "current_disposition": r["current_disposition"],
+                    "created_at": r["decision_created_at"],
+                }
+            )
 
         return {"exceptions": exceptions_list, "total_count": len(exceptions_list)}
     finally:
@@ -599,7 +619,7 @@ def get_audit_events():
         return {
             "audit_events": [dict(e) for e in events],
             "human_approvals": [dict(a) for a in approvals],
-            "agent_investigations": [dict(i) for i in investigations]
+            "agent_investigations": [dict(i) for i in investigations],
         }
     finally:
         conn.close()
@@ -612,7 +632,7 @@ def get_evaluation_report():
     if not report_file.exists():
         return {
             "status": "not_generated",
-            "message": "Evaluation report has not been generated yet. Run 'python eval_benchmarks.py' to generate."
+            "message": "Evaluation report has not been generated yet. Run 'python eval_benchmarks.py' to generate.",
         }
     try:
         with open(report_file, "r", encoding="utf-8") as f:
@@ -643,6 +663,6 @@ def get_prometheus_metrics():
         f"paisaguard_payout_match_rate_percent {m['payout_metrics']['match_rate_percent']}",
         "# HELP paisaguard_unresolved_exceptions Unresolved exceptions pending in queue",
         "# TYPE paisaguard_unresolved_exceptions gauge",
-        f"paisaguard_unresolved_exceptions {m['governance']['unresolved_exceptions']}"
+        f"paisaguard_unresolved_exceptions {m['governance']['unresolved_exceptions']}",
     ]
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")

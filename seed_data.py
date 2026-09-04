@@ -10,9 +10,9 @@ Architectural Guarantees:
 4. Reads from checked-in fixtures/ground_truth_manifest.json.
 """
 
-import sys
-import json
 import argparse
+import json
+import sys
 from pathlib import Path
 from typing import Optional, Union
 
@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from db import init_db, get_db_connection, get_db_cursor, get_db_path, log_audit_event
+from db import get_db_connection, get_db_cursor, get_db_path, init_db, log_audit_event
 from money import require_paise
 
 MANIFEST_PATH = BASE_DIR / "fixtures" / "ground_truth_manifest.json"
@@ -38,15 +38,17 @@ def seed_database(db_path: Optional[Union[str, Path]] = None, reset: bool = Fals
     try:
         existing_orders = conn.execute("SELECT COUNT(*) FROM oms_orders").fetchone()[0]
         existing_settlements = conn.execute("SELECT COUNT(*) FROM razorpay_settlements").fetchone()[0]
-        
+
         if (existing_orders > 0 or existing_settlements > 0) and not reset:
-            print(f"[seed_data] Notice: Database at {target_db} already populated ({existing_orders} orders, {existing_settlements} settlements).")
+            print(
+                f"[seed_data] Notice: Database at {target_db} already populated ({existing_orders} orders, {existing_settlements} settlements)."
+            )
             print("[seed_data] Pass --reset to purge and re-seed. Skipping seeding.")
             return {
                 "status": "skipped",
                 "reason": "already_populated",
                 "oms_orders": existing_orders,
-                "settlements": existing_settlements
+                "settlements": existing_settlements,
             }
     finally:
         conn.close()
@@ -65,78 +67,72 @@ def seed_database(db_path: Optional[Union[str, Path]] = None, reset: bool = Fals
         # OMS order
         if tx.get("oms_order"):
             o = tx["oms_order"]
-            oms_rows.append((
-                o["order_id"],
-                o.get("business_tx_id", tx.get("business_tx_id")),
-                require_paise(o["amount_paise"]),
-                o.get("currency", "INR"),
-                o.get("customer_id"),
-                o["source_payload_hash"],
-                o["created_at"],
-                o.get("status", "created")
-            ))
+            oms_rows.append(
+                (
+                    o["order_id"],
+                    o.get("business_tx_id", tx.get("business_tx_id")),
+                    require_paise(o["amount_paise"]),
+                    o.get("currency", "INR"),
+                    o.get("customer_id"),
+                    o["source_payload_hash"],
+                    o["created_at"],
+                    o.get("status", "created"),
+                )
+            )
 
         # Razorpay settlement
         if tx.get("settlement"):
             s = tx["settlement"]
-            settle_rows.append((
-                s["payment_id"],
-                s.get("business_tx_id", tx.get("business_tx_id")),
-                s.get("order_id"),
-                s.get("payout_id"),
-                require_paise(s["amount_paise"]),
-                require_paise(s["fee_paise"]),
-                require_paise(s["tax_paise"]),
-                require_paise(s["net_paise"]),
-                s.get("currency", "INR"),
-                s.get("payment_method", "upi"),
-                s["source_payload_hash"],
-                s["settled_at"],
-                s.get("status", "settled")
-            ))
+            settle_rows.append(
+                (
+                    s["payment_id"],
+                    s.get("business_tx_id", tx.get("business_tx_id")),
+                    s.get("order_id"),
+                    s.get("payout_id"),
+                    require_paise(s["amount_paise"]),
+                    require_paise(s["fee_paise"]),
+                    require_paise(s["tax_paise"]),
+                    require_paise(s["net_paise"]),
+                    s.get("currency", "INR"),
+                    s.get("payment_method", "upi"),
+                    s["source_payload_hash"],
+                    s["settled_at"],
+                    s.get("status", "settled"),
+                )
+            )
 
         # Webhook event
         if tx.get("webhook_event"):
             w = tx["webhook_event"]
-            webhook_rows.append((
-                w["event_id"],
-                w.get("payment_id"),
-                w["source_payload_hash"],
-                w["payload_json"],
-                w.get("hmac_signature"),
-                w["received_at"],
-                w.get("status", "received")
-            ))
+            webhook_rows.append(
+                (
+                    w["event_id"],
+                    w.get("payment_id"),
+                    w["source_payload_hash"],
+                    w["payload_json"],
+                    w.get("hmac_signature"),
+                    w["received_at"],
+                    w.get("status", "received"),
+                )
+            )
 
     # Bank payout credits
     bank_rows = []
     for b in manifest.get("bank_payout_credits", []):
-        bank_rows.append((
-            b["credit_id"],
-            b.get("payout_id"),
-            b["utr_number"],
-            require_paise(b["credit_amount_paise"]),
-            b["source_payload_hash"],
-            b["credited_at"],
-            b.get("account_tail"),
-            b.get("status", "credited")
-        ))
+        bank_rows.append(
+            (
+                b["credit_id"],
+                b.get("payout_id"),
+                b["utr_number"],
+                require_paise(b["credit_amount_paise"]),
+                b["source_payload_hash"],
+                b["credited_at"],
+                b.get("account_tail"),
+                b.get("status", "credited"),
+            )
+        )
 
     # Pre-configure approved corporate card override rule
-    rules = [
-        (
-            "rule_corporate_card_surcharge_2026",
-            "MDR_SURCHARGE",
-            "payment_method",
-            "corporate_card",
-            "APPROVE_CORPORATE_CARD_CHARGE",
-            "CORPORATE_CARD_SURCHARGE",
-            "Approved 2.5% MDR + 18% GST for commercial card interchange surcharge",
-            "finops_policy_engine",
-            "2026-08-01 00:00:00",
-            "ACTIVE"
-        )
-    ]
 
     with get_db_cursor(target_db) as cursor:
         if reset:
@@ -152,34 +148,46 @@ def seed_database(db_path: Optional[Union[str, Path]] = None, reset: bool = Fals
             cursor.execute("DELETE FROM audit_events;")
             cursor.execute("DELETE FROM resolved_rules;")
 
-        cursor.executemany("""
+        cursor.executemany(
+            """
             INSERT INTO oms_orders (
                 order_id, business_tx_id, amount_paise, currency, customer_id,
                 source_payload_hash, created_at, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-        """, oms_rows)
+        """,
+            oms_rows,
+        )
 
-        cursor.executemany("""
+        cursor.executemany(
+            """
             INSERT INTO razorpay_settlements (
                 payment_id, business_tx_id, order_id, payout_id, amount_paise,
                 fee_paise, tax_paise, net_paise, currency, payment_method,
                 source_payload_hash, settled_at, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, settle_rows)
+        """,
+            settle_rows,
+        )
 
-        cursor.executemany("""
+        cursor.executemany(
+            """
             INSERT INTO bank_payout_credits (
                 credit_id, payout_id, utr_number, credit_amount_paise,
                 source_payload_hash, credited_at, account_tail, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-        """, bank_rows)
+        """,
+            bank_rows,
+        )
 
-        cursor.executemany("""
+        cursor.executemany(
+            """
             INSERT INTO webhook_events (
                 event_id, payment_id, source_payload_hash, payload_json,
                 hmac_signature, received_at, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?);
-        """, webhook_rows)
+        """,
+            webhook_rows,
+        )
 
         # Pre-configured rules table initialized empty on baseline reset
         # Rules are added dynamically via human approval or rule engine API
@@ -195,8 +203,8 @@ def seed_database(db_path: Optional[Union[str, Path]] = None, reset: bool = Fals
             "settlements_count": len(settle_rows),
             "bank_credits_count": len(bank_rows),
             "webhook_events_count": len(webhook_rows),
-            "total_source_records": len(oms_rows) + len(settle_rows) + len(bank_rows) + len(webhook_rows)
-        }
+            "total_source_records": len(oms_rows) + len(settle_rows) + len(bank_rows) + len(webhook_rows),
+        },
     )
 
     total_records = len(oms_rows) + len(settle_rows) + len(bank_rows) + len(webhook_rows)
@@ -213,7 +221,7 @@ def seed_database(db_path: Optional[Union[str, Path]] = None, reset: bool = Fals
         "settlements": len(settle_rows),
         "bank_credits": len(bank_rows),
         "webhook_events": len(webhook_rows),
-        "total_source_records": total_records
+        "total_source_records": total_records,
     }
 
 
