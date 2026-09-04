@@ -17,6 +17,12 @@ def compute_dataset_seed_hash(conn: sqlite3.Connection) -> str:
     """
     Computes a deterministic SHA-256 fingerprint across operational inputs (OMS orders and settlements).
     Guarantees end-to-end dataset provenance and tamper-evident auditability.
+
+    Note on Entropy Slicing:
+    We truncate the SHA-256 hexdigest to 32 hex characters (128 bits of entropy).
+    This provides 2^64 birthday attack collision resistance — mathematically impossible
+    to collide across billions of financial datasets — while ensuring compact database
+    indexing and clean formatting in CSV and JSON audit reports.
     """
     hasher = hashlib.sha256()
     cursor = conn.cursor()
@@ -259,13 +265,16 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
             ))
 
     # PASS 4: Daily-to-Monthly GST ITC Safeguard Audit
-    total_daily_tax = sum(to_decimal(r["tax"]) for _, r in df_settle.iterrows())
+    total_daily_tax = sum((to_decimal(r["tax"]) for _, r in df_settle.iterrows()), Decimal("0.00")) if not df_settle.empty else Decimal("0.00")
     monthly_invoice_tax = to_decimal(df_gst_inv.iloc[0]["total_gst"]) if not df_gst_inv.empty else Decimal("0.00")
     gst_tax_leakage = float(round_curr(total_daily_tax - monthly_invoice_tax))
 
-    # Persist outputs
-    df_matched = pd.DataFrame(matched_records)
-    df_exceptions = pd.DataFrame(exception_records)
+    # Persist outputs with preserved column schema even if records are empty
+    matched_cols = ["order_id", "payment_id", "gross_amount", "settled_amount", "fee", "tax", "net_amount", "sub_paise_drift", "status", "settled_at"]
+    exception_cols = ["order_id", "payment_id", "exception_code", "variance", "exception_msg", "status"]
+
+    df_matched = pd.DataFrame(matched_records) if matched_records else pd.DataFrame(columns=matched_cols)
+    df_exceptions = pd.DataFrame(exception_records) if exception_records else pd.DataFrame(columns=exception_cols)
 
     matched_path = OUT_DIR / "final-matched-ledger.csv"
     exception_path = OUT_DIR / "final-exception-queue.csv"

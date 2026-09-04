@@ -3,11 +3,13 @@ import hmac
 import hashlib
 import base64
 import json
+import time
 import logging
 import sqlite3
 from typing import Dict, Any, Optional, Tuple
 from decimal import Decimal
-from fastapi import FastAPI, HTTPException, Header, Request, Response, status
+from collections import defaultdict
+from fastapi import FastAPI, HTTPException, Header, Request, Response, Depends, status
 from pydantic import BaseModel, Field
 from pathlib import Path
 from db import get_db_connection, get_db_cursor, DEFAULT_DB_PATH
@@ -24,14 +26,53 @@ logger = logging.getLogger("paisaguard.gateway")
 app = FastAPI(
     title="PaisaGuard Gateway",
     description="Deterministic Financial Reconciliation, HMAC Ingestion & AI Diagnostic Engine",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 # Webhook Secret & Environment Configuration
 ENVIRONMENT = os.environ.get("PAISAGUARD_ENV", "development").lower()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "rzp_sec_buildathon_2026_demo")
+PAISAGUARD_REQUIRE_HMAC = os.environ.get("PAISAGUARD_REQUIRE_HMAC", "").lower() in ("1", "true", "yes")
+PAISAGUARD_API_TOKEN = os.environ.get("PAISAGUARD_API_TOKEN", "")
+
 if ENVIRONMENT == "production" and RAZORPAY_WEBHOOK_SECRET == "rzp_sec_buildathon_2026_demo":
     raise RuntimeError("CRITICAL SECURITY VIOLATION: Default demo webhook secret cannot be used in production environment!")
+
+
+# In-Memory Sliding-Window Rate Limiter
+class InMemoryRateLimiter:
+    """
+    Sliding-window in-memory rate limiter per IP address.
+    Default: max 120 requests per 60-second window.
+    """
+    def __init__(self, max_requests: int = 120, window_seconds: float = 60.0):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(list)
+
+    def is_allowed(self, client_ip: str) -> Tuple[bool, int]:
+        now = time.time()
+        window_start = now - self.window_seconds
+        self.requests[client_ip] = [t for t in self.requests[client_ip] if t > window_start]
+        if len(self.requests[client_ip]) >= self.max_requests:
+            return False, 0
+        self.requests[client_ip].append(now)
+        return True, self.max_requests - len(self.requests[client_ip])
+
+rate_limiter = InMemoryRateLimiter(max_requests=120, window_seconds=60.0)
+
+
+def verify_admin_token(x_paisaguard_token: Optional[str] = Header(None)):
+    """
+    Optional administrative token guard for CFO / Operations controls.
+    Active only when PAISAGUARD_API_TOKEN environment variable is set.
+    """
+    if PAISAGUARD_API_TOKEN:
+        if not x_paisaguard_token or not hmac.compare_digest(x_paisaguard_token, PAISAGUARD_API_TOKEN):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Valid X-PaisaGuard-Token header is required to access administrative FinOps controls."
+            )
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str], secret: str) -> Tuple[bool, str]:
@@ -80,14 +121,16 @@ def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str], s
 
     return False, "none"
 
+
 class WebhookPayload(BaseModel):
     event: str = Field(..., json_schema_extra={"example": "payment.captured"})
     payment_id: str = Field(..., json_schema_extra={"example": "pay_rzp_9901"})
     order_id: Optional[str] = Field(None, json_schema_extra={"example": "ord_in_1050"})
-    amount: float = Field(..., json_schema_extra={"example": 1500.0})
-    fee: Optional[float] = Field(0.0, json_schema_extra={"example": 30.0})
-    tax: Optional[float] = Field(0.0, json_schema_extra={"example": 5.4})
+    amount: Decimal = Field(..., json_schema_extra={"example": "1500.00"})
+    fee: Optional[Decimal] = Field(Decimal("0.00"), json_schema_extra={"example": "30.00"})
+    tax: Optional[Decimal] = Field(Decimal("0.00"), json_schema_extra={"example": "5.40"})
     payment_method: Optional[str] = Field("upi", json_schema_extra={"example": "upi"})
+
 
 class RuleOverrideRequest(BaseModel):
     rule_id: str
@@ -96,13 +139,15 @@ class RuleOverrideRequest(BaseModel):
     exception_code: str = "FEE_DEDUCTION"
     description: str = "Manual override rule approved via API"
 
+
 class AIDiagnosticRequest(BaseModel):
     order_id: str
     payment_id: str
-    gross_amount: float
-    actual_fee: float
-    expected_fee: float
+    gross_amount: Decimal
+    actual_fee: Decimal
+    expected_fee: Decimal
     exception_code: str
+
 
 class AIDiagnosticResponse(BaseModel):
     order_id: str
@@ -112,36 +157,41 @@ class AIDiagnosticResponse(BaseModel):
     policy_approved: bool
     policy_reason: str
 
+
 # Deterministic Policy Gatekeeper (Trust Boundary Enforcement)
 class PolicyGatekeeper:
-    MAX_ALLOWABLE_OVERRIDE_INR = 50.00
-    MAX_ALLOWABLE_MDR_RATE = 0.035  # 3.5% absolute economic ceiling
+    MAX_ALLOWABLE_OVERRIDE_INR = Decimal("50.00")
+    MAX_ALLOWABLE_MDR_RATE = Decimal("0.035")  # 3.5% absolute economic ceiling
 
     @classmethod
-    def evaluate(cls, gross_amount: float, actual_fee: float, expected_fee: float, suggested_action: str) -> tuple[bool, str]:
+    def evaluate(cls, gross_amount: Decimal, actual_fee: Decimal, expected_fee: Decimal, suggested_action: str) -> tuple[bool, str]:
         variance = abs(actual_fee - expected_fee)
         if variance > cls.MAX_ALLOWABLE_OVERRIDE_INR:
             return False, f"Fee discrepancy ₹{variance:.2f} exceeds hard safety ceiling of ₹{cls.MAX_ALLOWABLE_OVERRIDE_INR:.2f}. Manual CFO sign-off required."
 
-        if gross_amount > 0:
+        if gross_amount > Decimal("0"):
             effective_mdr = actual_fee / gross_amount
         else:
-            effective_mdr = 0.0
+            effective_mdr = Decimal("0.0")
 
         if effective_mdr > cls.MAX_ALLOWABLE_MDR_RATE:
             return False, f"Effective MDR {effective_mdr*100:.2f}% breaches merchant contract cap {cls.MAX_ALLOWABLE_MDR_RATE*100:.2f}%."
 
         return True, "Deterministic Policy Gatekeeper: Verified within safe economic bounds."
 
+
 @app.get("/")
 def root():
     return {
         "system": "PaisaGuard FinOps Engine",
         "status": "operational",
+        "environment": ENVIRONMENT,
         "wal_mode": True,
         "hmac_verification": True,
+        "hmac_policy": "enforced" if (ENVIRONMENT != "development" or PAISAGUARD_REQUIRE_HMAC) else "development_bypass_allowed",
         "policy_gatekeeper": "active"
     }
+
 
 @app.post("/webhooks/razorpay")
 async def ingest_webhook(
@@ -151,15 +201,35 @@ async def ingest_webhook(
 ):
     """
     Production-grade webhook ingestion:
-    1. Reads raw byte buffer to guarantee bit-for-bit HMAC SHA256 integrity before parsing.
-    2. Supports both Base64 and Hex-encoded HMAC digests for universal payment gateway compatibility.
-    3. Handles both flat JSON payloads and standard nested Razorpay event payload schemas.
-    4. Enforces atomic relational UPSERT on payment_id to physically eliminate race conditions.
+    1. Enforces client-IP rate limiting (120 req/min).
+    2. Enforces mandatory HMAC-SHA256 signatures in production/staging (or when PAISAGUARD_REQUIRE_HMAC=1).
+    3. Reads raw byte buffer to guarantee bit-for-bit HMAC SHA256 integrity before parsing.
+    4. Supports both Base64 and Hex-encoded HMAC digests for universal payment gateway compatibility.
+    5. Ingests using arbitrary-precision Decimal types to eliminate binary float drift.
+    6. Enforces atomic relational UPSERT on payment_id to physically eliminate race conditions.
     """
+    # 1. Rate Limiting Check
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    allowed, _ = rate_limiter.is_allowed(client_ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded: Maximum 120 requests per minute. Please throttle."
+        )
+
     raw_body = await request.body()
 
-    # Verify HMAC-SHA256 signature (supports both Hex and Base64 encodings)
-    if x_razorpay_signature:
+    # 2. Mandatory HMAC Verification Policy
+    if not x_razorpay_signature:
+        if ENVIRONMENT != "development" or PAISAGUARD_REQUIRE_HMAC:
+            logger.error('{"event":"hmac_rejected","reason":"missing_signature_header","env":"%s"}' % ENVIRONMENT)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Security policy violation: Missing X-Razorpay-Signature header. HMAC signature is strictly required in production/staging environments."
+            )
+        else:
+            logger.warning('{"event":"hmac_warning","reason":"unsigned_payload_dev_bypass","env":"development"}')
+    else:
         verified, encoding = verify_webhook_signature(raw_body, x_razorpay_signature, RAZORPAY_WEBHOOK_SECRET)
         if not verified:
             raise HTTPException(
@@ -194,9 +264,9 @@ async def ingest_webhook(
                 event=body_json.get("event", "payment.captured"),
                 payment_id=entity.get("id", "pay_unknown"),
                 order_id=entity.get("order_id"),
-                amount=float(round_curr(amt_dec)),
-                fee=float(round_curr(fee_dec)),
-                tax=float(round_curr(tax_dec)),
+                amount=round_curr(amt_dec),
+                fee=round_curr(fee_dec),
+                tax=round_curr(tax_dec),
                 payment_method=entity.get("method", "upi")
             )
         else:
@@ -257,6 +327,7 @@ async def ingest_webhook(
         "hmac_verified": bool(x_razorpay_signature)
     }
 
+
 @app.post("/ai/diagnose", response_model=AIDiagnosticResponse)
 def diagnose_discrepancy(req: AIDiagnosticRequest):
     """
@@ -267,7 +338,7 @@ def diagnose_discrepancy(req: AIDiagnosticRequest):
     fee_diff = req.actual_fee - req.expected_fee
     
     # Read-only diagnostic classification
-    if "corporate" in req.order_id.lower() or abs(fee_diff - (req.gross_amount * 0.005)) < 1.0:
+    if "corporate" in req.order_id.lower() or abs(fee_diff - (req.gross_amount * Decimal("0.005"))) < Decimal("1.0"):
         classification = "CORPORATE_CARD_INTERCHANGE_SURCHARGE"
         confidence = 0.96
         suggested_action = "APPROVE_CORPORATE_CARD_CHARGE"
@@ -293,13 +364,15 @@ def diagnose_discrepancy(req: AIDiagnosticRequest):
         policy_reason=policy_reason
     )
 
-@app.post("/reconcile/sweep")
+
+@app.post("/reconcile/sweep", dependencies=[Depends(verify_admin_token)])
 def trigger_sweep():
     try:
         summary = execute_reconciliation_pipeline(DEFAULT_DB_PATH)
         return {"status": "completed", "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/metrics")
 def get_metrics():
@@ -327,6 +400,7 @@ def get_metrics():
     finally:
         conn.close()
 
+
 @app.get("/metrics/prometheus")
 def get_prometheus_metrics():
     """Prometheus-compatible plain text metrics exposition."""
@@ -353,7 +427,8 @@ def get_prometheus_metrics():
     ]
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")
 
-@app.post("/rules/resolve")
+
+@app.post("/rules/resolve", dependencies=[Depends(verify_admin_token)])
 def add_resolution_rule(req: RuleOverrideRequest):
     with get_db_cursor(DEFAULT_DB_PATH) as cursor:
         cursor.execute("""
