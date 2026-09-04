@@ -181,12 +181,8 @@ def seed_database(db_path: Optional[Union[str, Path]] = None, reset: bool = Fals
             ) VALUES (?, ?, ?, ?, ?, ?, ?);
         """, webhook_rows)
 
-        cursor.executemany("""
-            INSERT OR REPLACE INTO resolved_rules (
-                rule_id, rule_type, scope_field, scope_value, action,
-                exception_code, description, created_by, created_at, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, rules)
+        # Pre-configured rules table initialized empty on baseline reset
+        # Rules are added dynamically via human approval or rule engine API
 
     log_audit_event(
         target_db,

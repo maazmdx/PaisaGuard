@@ -35,6 +35,7 @@ from fastapi import FastAPI, HTTPException, Header, Request, Response, Depends, 
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
+OUT_DIR = BASE_DIR / "out"
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 

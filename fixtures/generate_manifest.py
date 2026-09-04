@@ -3,6 +3,7 @@ generate_manifest.py — Generates the checked-in ground_truth_manifest.json.
 
 Creates:
 - 100 Operational Business Transactions (generating 300+ source records across OMS, Razorpay, Bank, and Webhooks).
+- 2 Operational Unmatched Bank Credits (subject_type: BANK_CREDIT).
 - 30 Held-Out Evaluation Transactions (for testing AI root cause classification and deliberate abstention).
 - Polymorphic subjects: BUSINESS_TX, PAYOUT, and BANK_CREDIT.
 """
@@ -19,7 +20,6 @@ if str(BASE_DIR) not in sys.path:
 
 from money import parse_inr_to_paise, calc_mdr_fee_and_tax_paise
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = BASE_DIR / "fixtures" / "ground_truth_manifest.json"
 
 
@@ -68,7 +68,7 @@ def build_manifest():
 
         # Categorize operational scenarios
         if 81 <= i <= 84:
-            # Scenario: Corporate card fee surcharge discrepancy
+            # Corporate card fee surcharge discrepancy (unresolved exception at baseline before rule/approval)
             expected_status = "EXCEPTION"
             expected_root_cause = "CORPORATE_CARD_SURCHARGE"
             should_abstain = False
@@ -81,11 +81,11 @@ def build_manifest():
             payout_rel = payout_id
 
         elif 85 <= i <= 88:
-            # Scenario: Delayed bank payout credit (settlement allocated to payout, but payout not in bank feed)
-            expected_status = "EXCEPTION"
-            expected_root_cause = "DELAYED_BANK_CREDIT"
+            # Clean transaction at business_tx level, but allocated to a delayed payout batch
+            expected_status = "MATCHED"
+            expected_root_cause = "CLEAN_TRANSACTION"
             should_abstain = False
-            expected_disposition = "AWAIT_BANK_CREDIT"
+            expected_disposition = "RECONCILED"
             payment_method = "upi"
             fee_paise, tax_paise = calc_mdr_fee_and_tax_paise(amount_paise, mdr_bps=200, gst_bps=1800)
             net_paise = amount_paise - (fee_paise + tax_paise)
@@ -94,7 +94,7 @@ def build_manifest():
             payout_rel = f"payout_delayed_aug_{payout_idx:02d}"
 
         elif 89 <= i <= 91:
-            # Scenario: Unsettled OMS order (missing settlement in Razorpay)
+            # Unsettled OMS order (missing settlement in Razorpay)
             expected_status = "EXCEPTION"
             expected_root_cause = "UNSETTLED_OMS_ORDER"
             should_abstain = False
@@ -107,7 +107,7 @@ def build_manifest():
             payout_rel = None
 
         elif 92 <= i <= 94:
-            # Scenario: Orphan settlement (present in Razorpay, missing in OMS)
+            # Orphan settlement (present in Razorpay, missing in OMS)
             expected_status = "EXCEPTION"
             expected_root_cause = "ORPHAN_SETTLEMENT"
             should_abstain = False
@@ -120,7 +120,7 @@ def build_manifest():
             payout_rel = payout_id
 
         elif 95 <= i <= 96:
-            # Scenario: Partial refund / amount mismatch
+            # Partial refund / amount mismatch
             expected_status = "EXCEPTION"
             expected_root_cause = "PARTIAL_REFUND_MISMATCH"
             should_abstain = False
@@ -135,11 +135,11 @@ def build_manifest():
             settle_amount_paise = amount_paise - 50000
 
         elif 97 <= i <= 98:
-            # Scenario: Payout bank amount mismatch (handled at payout level, individual tx clean OMS-RZP)
-            expected_status = "EXCEPTION"
-            expected_root_cause = "BANK_AMOUNT_MISMATCH"
+            # Clean at business_tx level; payout bank mismatch occurs at payout level
+            expected_status = "MATCHED"
+            expected_root_cause = "CLEAN_TRANSACTION"
             should_abstain = False
-            expected_disposition = "DISPUTE_BANK_VARIANCE"
+            expected_disposition = "RECONCILED"
             payment_method = "upi"
             fee_paise, tax_paise = calc_mdr_fee_and_tax_paise(amount_paise, mdr_bps=200, gst_bps=1800)
             net_paise = amount_paise - (fee_paise + tax_paise)
@@ -148,8 +148,8 @@ def build_manifest():
             payout_rel = "payout_mismatch_aug_10"
 
         else:
-            # Clean 3-way match
-            expected_status = "3WAY_MATCHED"
+            # Clean match
+            expected_status = "MATCHED"
             expected_root_cause = "CLEAN_TRANSACTION"
             should_abstain = False
             expected_disposition = "RECONCILED"
@@ -290,12 +290,9 @@ def build_manifest():
     manifest["bank_payout_credits"] = []
     for pid, s_list in payout_groups.items():
         total_net = sum(s["net_paise"] for s in s_list)
-        # Check if delayed or mismatched
         if "delayed" in pid:
-            # Delayed payout: Bank credit is missing!
             continue
         elif "mismatch" in pid:
-            # Bank amount mismatch: Bank deposited less (e.g. ₹100.00 less = 10000 paise)
             bank_amt = total_net - 10000
         else:
             bank_amt = total_net
@@ -316,7 +313,6 @@ def build_manifest():
         }
         manifest["bank_payout_credits"].append(cr_rec)
 
-    # Add the unmatched direct credits to the bank credits list
     for ubc in unmatched_bank_credits:
         credit_raw = f"credit_id:{ubc['credit_id']}:amt:{ubc['credit_amount_paise']}:utr:{ubc['utr_number']}"
         manifest["bank_payout_credits"].append({
@@ -348,7 +344,7 @@ def build_manifest():
 
         if 1 <= j <= 10:
             # Clean match
-            exp_status = "3WAY_MATCHED"
+            exp_status = "MATCHED"
             exp_cause = "CLEAN_TRANSACTION"
             abstain = False
             exp_disp = "RECONCILED"
@@ -372,21 +368,21 @@ def build_manifest():
             has_s = True
             settle_p = amount_paise
 
-        elif 16 <= j <= 19:
-            # Delayed bank credit
+        elif 16 <= j <= 18:
+            # Unsettled OMS order
             exp_status = "EXCEPTION"
-            exp_cause = "DELAYED_BANK_CREDIT"
+            exp_cause = "UNSETTLED_OMS_ORDER"
             abstain = False
-            exp_disp = "AWAIT_BANK_CREDIT"
+            exp_disp = "AWAIT_SETTLEMENT"
             method = "upi"
-            fee_p, tax_p = calc_mdr_fee_and_tax_paise(amount_paise, 200, 1800)
-            net_p = amount_paise - (fee_p + tax_p)
+            fee_p, tax_p = 0, 0
+            net_p = 0
             has_o = True
-            has_s = True
-            settle_p = amount_paise
-            payout_id = f"payout_eval_delayed_{j}"
+            has_s = False
+            settle_p = 0
+            payout_id = None
 
-        elif 20 <= j <= 22:
+        elif 19 <= j <= 21:
             # Orphan settlement
             exp_status = "EXCEPTION"
             exp_cause = "ORPHAN_SETTLEMENT"
@@ -399,7 +395,7 @@ def build_manifest():
             has_s = True
             settle_p = amount_paise
 
-        elif 23 <= j <= 25:
+        elif 22 <= j <= 24:
             # Partial refund
             exp_status = "EXCEPTION"
             exp_cause = "PARTIAL_REFUND_MISMATCH"
@@ -412,32 +408,34 @@ def build_manifest():
             has_s = True
             settle_p = amount_paise - 25000  # ₹250 refund
 
-        elif 26 <= j <= 28:
+        elif 25 <= j <= 27:
             # Deliberate Genuine Ambiguity: agent MUST abstain!
             exp_status = "EXCEPTION"
             exp_cause = "GENUINE_AMBIGUITY_INSUFFICIENT_DATA"
             abstain = True
             exp_disp = "ESCALATE_TO_CFO"
-            method = "unknown"
-            fee_p, tax_p = 100, 18  # Incoherent fees
-            net_p = amount_paise - 118
+            method = "incoherent_pricing_tier"
+            # Gross amounts match, but fee has conflicting unmapped deduction
+            settle_p = amount_paise
+            fee_p = 1234  # Non-standard fee without contract formula
+            tax_p = 0
+            net_p = amount_paise - fee_p
             has_o = True
             has_s = True
-            settle_p = amount_paise - 118
 
         else:
-            # Bank amount mismatch
-            exp_status = "EXCEPTION"
-            exp_cause = "BANK_AMOUNT_MISMATCH"
+            # Delayed payout batch allocation
+            exp_status = "MATCHED"  # matched at business_tx level
+            exp_cause = "CLEAN_TRANSACTION"
             abstain = False
-            exp_disp = "DISPUTE_BANK_VARIANCE"
+            exp_disp = "RECONCILED"
             method = "upi"
             fee_p, tax_p = calc_mdr_fee_and_tax_paise(amount_paise, 200, 1800)
             net_p = amount_paise - (fee_p + tax_p)
             has_o = True
             has_s = True
             settle_p = amount_paise
-            payout_id = "payout_eval_mismatch_03"
+            payout_id = f"payout_eval_delayed_{j}"
 
         oms_rec = None
         if has_o:
@@ -511,9 +509,6 @@ def build_manifest():
 
     print(f"Ground-truth manifest successfully written to: {MANIFEST_PATH}")
     print(f"Total transactions: {len(manifest['transactions'])}")
-    print(f"  - Operational: {sum(1 for t in manifest['transactions'] if not t['is_held_out'])}")
-    print(f"  - Held-out   : {sum(1 for t in manifest['transactions'] if t['is_held_out'])}")
-    print(f"  - Bank payout credits: {len(manifest['bank_payout_credits'])}")
 
 
 if __name__ == "__main__":

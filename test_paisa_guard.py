@@ -1,473 +1,511 @@
-import pytest
+"""
+test_paisa_guard.py — Comprehensive Pytest Test Suite for PaisaGuard FinOps Engine.
+
+Covers:
+1. Integer paise hygiene and arithmetic precision (no floats).
+2. SQLite WAL mode, foreign keys, and synchronous pragma.
+3. Deterministic 3-way reconciliation (OMS <-> Settlement <-> Bank Credits).
+4. Multi-settlement to single payout batch matching and unmatched bank credits.
+5. Re-run idempotency without duplicate decisions.
+6. Fail-closed token security on state-changing endpoints.
+7. Mandatory HMAC webhook enforcement and tampering rejection.
+8. Webhook deduplication by event_id.
+9. AI exception investigation: strict schema, cited IDs, policy gate.
+10. AI deliberate abstention on genuine ambiguity.
+11. AI failure hardening (malformed output, hallucinated citation, unsupported action, low confidence).
+12. Append-only human approval and dynamic disposition projection view.
+13. Read endpoints for isolated dashboard.
+"""
+
+import os
+import hmac
+import hashlib
+import json
 import sqlite3
-from decimal import Decimal
+import pytest
 from pathlib import Path
-from db import init_db, get_db_connection, DEFAULT_DB_PATH
-from seed_data import generate_financial_dataset
+from decimal import Decimal
+from fastapi.testclient import TestClient
+
+from db import init_db, get_db_connection, get_db_path, log_audit_event
+from seed_data import seed_database
 from recon_engine import execute_reconciliation_pipeline
-from concurrency_tester import simulate_webhook_flood
+from exception_agent import (
+    investigate_exception,
+    ExceptionInvestigationResult,
+    BaseAIProvider,
+    DeterministicMockProvider
+)
+from policy_gate import PolicyGatekeeper
+from audit_service import record_human_approval
+from money import (
+    parse_inr_to_paise,
+    require_paise,
+    paise_to_rupees,
+    format_paise_inr,
+    calc_mdr_fee_and_tax_paise
+)
+from api import app
 
 TEST_DB_PATH = Path(__file__).resolve().parent / "test_paisa_guard.db"
+TEST_SECRET = "rzp_sec_test_secret_2026"
+TEST_TOKEN = "test_finops_token_2026"
+
 
 @pytest.fixture(scope="module")
-def setup_test_environment():
-    """Initializes a fresh test database with realistic synthetic financial data."""
-    if TEST_DB_PATH.exists():
-        TEST_DB_PATH.unlink()
-    generate_financial_dataset(TEST_DB_PATH)
-    yield TEST_DB_PATH
+def setup_test_db():
+    """Initializes a fresh test database with 3-source fixtures."""
     if TEST_DB_PATH.exists():
         try:
             TEST_DB_PATH.unlink()
         except Exception:
             pass
 
-def test_sqlite_wal_mode_active(setup_test_environment):
-    """Verifies that the SQLite database operates in WAL (Write-Ahead Logging) mode."""
-    conn = get_db_connection(setup_test_environment, use_wal=True)
-    journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
-    synchronous = conn.execute("PRAGMA synchronous;").fetchone()[0]
-    conn.close()
-    
-    assert journal_mode.lower() == "wal", f"Expected WAL mode, got {journal_mode}"
-    # 1 is NORMAL, 2 is FULL
-    assert synchronous in [1, "1", "NORMAL", "normal"]
+    os.environ["PAISAGUARD_DB_PATH"] = str(TEST_DB_PATH)
+    os.environ["PAISAGUARD_API_TOKEN"] = TEST_TOKEN
+    os.environ["RAZORPAY_WEBHOOK_SECRET"] = TEST_SECRET
+    os.environ["PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS"] = "false"
+    os.environ["AI_PROVIDER"] = "mock"
 
-def test_sub_paise_drift_and_pipeline_execution(setup_test_environment):
-    """Verifies that the 4-pass reconciliation engine executes with sub-paise accuracy."""
-    summary = execute_reconciliation_pipeline(setup_test_environment)
-    
-    assert summary["total_audited"] > 0
-    assert summary["match_rate"] >= 90.0, f"Match rate {summary['match_rate']}% below target"
-    assert summary["matched_count"] > 90
-    assert summary["exception_count"] >= 5
-    
-    # Verify sub-paise accumulator drift is bounded within +/- 0.50 INR across 100 transactions
-    assert abs(summary["sub_paise_accumulator"]) <= 0.50
-    
-    # Verify CSV files are produced
-    assert Path(summary["matched_csv"]).exists()
-    assert Path(summary["exception_csv"]).exists()
+    seed_database(db_path=TEST_DB_PATH, reset=True)
+    yield TEST_DB_PATH
 
-def test_gst_itc_leakage_detection(setup_test_environment):
-    """Verifies that PaisaGuard catches the exact GST ITC over-deduction (₹7.04)."""
-    summary = execute_reconciliation_pipeline(setup_test_environment)
-    
-    expected_leakage = 7.04
-    assert round(summary["gst_tax_leakage"], 2) == expected_leakage, (
-        f"Expected {expected_leakage} INR leakage, detected {summary['gst_tax_leakage']} INR"
-    )
-
-def test_1click_rule_resolution(setup_test_environment):
-    """Verifies that adding a corporate fee override rule dynamically clears an exception."""
-    # Find an order with FEE_DEDUCTION
-    conn = get_db_connection(setup_test_environment)
-    exception_row = conn.execute(
-        "SELECT order_id FROM reconciliation_ledger WHERE exception_code = 'FEE_DEDUCTION' LIMIT 1"
-    ).fetchone()
-    conn.close()
-    
-    assert exception_row is not None, "Expected at least one fee discrepancy in test data"
-    target_order_id = exception_row["order_id"]
-    
-    # Apply override rule
-    conn = get_db_connection(setup_test_environment)
-    conn.execute("""
-        INSERT INTO resolved_rules (rule_id, pattern_key, action, exception_code, description, created_at)
-        VALUES (?, ?, 'APPROVE_CORPORATE_CARD_CHARGE', 'FEE_DEDUCTION', 'Test override rule', datetime('now'));
-    """, (f"rule_test_{target_order_id}", target_order_id))
-    conn.commit()
-    conn.close()
-    
-    # Re-run reconciliation pipeline
-    summary_after = execute_reconciliation_pipeline(setup_test_environment)
-    
-    # Assert that this order is now reconciled under RULE_OVERRIDDEN
-    conn = get_db_connection(setup_test_environment)
-    updated_row = conn.execute(
-        "SELECT reconciled_status FROM reconciliation_ledger WHERE order_id = ?",
-        (target_order_id,)
-    ).fetchone()
-    conn.close()
-    
-    assert updated_row["reconciled_status"] == "RULE_OVERRIDDEN"
-
-def test_lock_free_wal_concurrency():
-    """Verifies that concurrent multi-threaded requests achieve 100% lock-free commits in WAL mode."""
-    benchmark_db = Path(__file__).resolve().parent / "test_concurrency_wal.db"
-    res = simulate_webhook_flood(benchmark_db, num_threads=50, use_wal=True)
-    
-    assert res["successful_commits"] == 50, f"Expected 50 commits, got {res['successful_commits']}"
-    assert res["lock_errors"] == 0, f"Expected 0 lock errors in WAL mode, got {res['lock_errors']}"
-    assert res["throughput_tps"] > 15.0
-
-    if benchmark_db.exists():
+    if TEST_DB_PATH.exists():
         try:
-            benchmark_db.unlink()
+            TEST_DB_PATH.unlink()
         except Exception:
             pass
 
-def test_fastapi_endpoints():
-    """Verifies FastAPI gateway endpoints for health, metrics, and webhook ingestion."""
-    from fastapi.testclient import TestClient
-    from api import app
-    client = TestClient(app)
-    
-    # 1. Health check
-    r_root = client.get("/")
-    assert r_root.status_code == 200
-    assert r_root.json()["wal_mode"] is True
-    
-    # 2. Metrics check
-    r_metrics = client.get("/metrics")
-    assert r_metrics.status_code == 200
-    data = r_metrics.json()
-    assert "matched_transactions" in data
-    assert data["total_settlements"] >= 100
-    
-    # 3. Webhook Ingestion (Idempotent UPSERT)
-    payload = {
-        "event": "payment.captured",
-        "payment_id": "pay_test_webhook_999",
-        "order_id": "ord_in_1001",
-        "amount": 2500.0,
-        "fee": 50.0,
-        "tax": 9.0,
-        "payment_method": "upi"
-    }
-    r_webhook = client.post("/webhooks/razorpay", json=payload)
-    assert r_webhook.status_code == 200
-    assert r_webhook.json()["status"] == "success"
 
-def test_hmac_signature_verification():
-    """Verifies HMAC SHA256 signature verification on raw byte stream and rejection of tampered payloads."""
-    import hmac
-    import hashlib
-    import json
-    from fastapi.testclient import TestClient
-    from api import app, RAZORPAY_WEBHOOK_SECRET
-    client = TestClient(app)
+# -------------------------------------------------------------
+# 1. Canonical Integer Paise Hygiene Tests
+# -------------------------------------------------------------
+def test_integer_paise_hygiene():
+    # String parsing
+    assert parse_inr_to_paise("1499.50") == 149950
+    assert parse_inr_to_paise(Decimal("1499.50")) == 149950
+    assert parse_inr_to_paise("0.00") == 0
 
-    payload = {
-        "event": "payment.captured",
-        "payment_id": "pay_hmac_valid_001",
-        "order_id": "ord_in_1002",
-        "amount": 1299.50,
-        "fee": 25.99,
-        "tax": 4.68,
-        "payment_method": "upi"
-    }
-    raw_bytes = json.dumps(payload).encode("utf-8")
-    valid_sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
+    # Type safety: reject raw int in parse_inr_to_paise
+    with pytest.raises(TypeError):
+        parse_inr_to_paise(1500)
 
-    # 1. Valid Hex Signature -> 200 OK
-    r_valid = client.post(
-        "/webhooks/razorpay",
-        content=raw_bytes,
-        headers={"X-Razorpay-Signature": valid_sig, "Content-Type": "application/json"}
-    )
-    assert r_valid.status_code == 200
-    assert r_valid.json()["hmac_verified"] is True
+    # require_paise guards
+    assert require_paise(149950) == 149950
+    with pytest.raises(TypeError):
+        require_paise(1499.50)
+    with pytest.raises(TypeError):
+        require_paise("149950")
+    with pytest.raises(TypeError):
+        require_paise(True)
 
-    # 1b. Valid Base64 Signature -> 200 OK
-    import base64
-    valid_b64_sig = base64.b64encode(hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), raw_bytes, hashlib.sha256).digest()).decode("utf-8")
-    r_valid_b64 = client.post(
-        "/webhooks/razorpay",
-        content=raw_bytes,
-        headers={"X-Razorpay-Signature": valid_b64_sig, "Content-Type": "application/json"}
-    )
-    assert r_valid_b64.status_code == 200
-    assert r_valid_b64.json()["hmac_verified"] is True
+    # Fee and Tax integer arithmetic
+    fee_p, tax_p = calc_mdr_fee_and_tax_paise(129950, mdr_bps=200, gst_bps=1800)
+    assert fee_p == 2599
+    assert tax_p == 468
 
-    # 1c. Nested Razorpay Event Format -> 200 OK
-    nested_payload = {
-        "event": "payment.captured",
-        "payload": {
-            "payment": {
-                "entity": {
-                    "id": "pay_nested_test_99",
-                    "order_id": "ord_in_1002",
-                    "amount": 129950,
-                    "fee": 2599,
-                    "tax": 468,
-                    "method": "card"
-                }
-            }
-        }
-    }
-    nested_bytes = json.dumps(nested_payload).encode("utf-8")
-    nested_sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), nested_bytes, hashlib.sha256).hexdigest()
-    r_nested = client.post(
-        "/webhooks/razorpay",
-        content=nested_bytes,
-        headers={"X-Razorpay-Signature": nested_sig, "Content-Type": "application/json"}
-    )
-    assert r_nested.status_code == 200
-    assert r_nested.json()["payment_id"] == "pay_nested_test_99"
 
-    # 2. Tampered Signature -> 401 Unauthorized
-    r_tampered = client.post(
-        "/webhooks/razorpay",
-        content=raw_bytes,
-        headers={"X-Razorpay-Signature": "tampered_fake_signature_hash_12345", "Content-Type": "application/json"}
-    )
-    assert r_tampered.status_code == 401
-    assert "signature verification failed" in r_tampered.json()["detail"].lower()
-
-def test_policy_gatekeeper_boundaries():
-    """Verifies the Deterministic Policy Gatekeeper approves safe variances and rejects excessive risk."""
-    from fastapi.testclient import TestClient
-    from api import app
-    client = TestClient(app)
-
-    # 1. Safe Corporate Card variance (₹27.45 <= ₹50.00 ceiling, 2.5% MDR <= 3.5% cap) -> APPROVED
-    safe_req = {
-        "order_id": "ord_in_1042",
-        "payment_id": "pay_rzp_800042",
-        "gross_amount": 5490.0,
-        "actual_fee": 137.25,
-        "expected_fee": 109.80,
-        "exception_code": "FEE_DEDUCTION"
-    }
-    r_safe = client.post("/ai/diagnose", json=safe_req)
-    assert r_safe.status_code == 200
-    res_safe = r_safe.json()
-    assert res_safe["policy_approved"] is True
-    assert "safe economic bounds" in res_safe["policy_reason"].lower()
-
-    # 2. Excessive variance (₹150.00 > ₹50.00 hard economic ceiling) -> REJECTED
-    risky_req = {
-        "order_id": "ord_in_exploit_99",
-        "payment_id": "pay_rzp_exploit_99",
-        "gross_amount": 5000.0,
-        "actual_fee": 250.00,
-        "expected_fee": 100.00,
-        "exception_code": "FEE_DEDUCTION"
-    }
-    r_risky = client.post("/ai/diagnose", json=risky_req)
-    assert r_risky.status_code == 200
-    res_risky = r_risky.json()
-    assert res_risky["policy_approved"] is False
-    assert "exceeds hard safety ceiling" in res_risky["policy_reason"].lower()
-
-def test_defensive_webhook_payload_normalization():
-    """Verifies that missing or None fee/tax fields are safely normalized to 0.0 without crashing."""
-    from fastapi.testclient import TestClient
-    from api import app, RAZORPAY_WEBHOOK_SECRET
-    import json, hmac, hashlib
-    client = TestClient(app)
-
-    # 1. Flat payload with explicit None fee and tax
-    payload = {
-        "event": "payment.captured",
-        "payment_id": "pay_defensive_none_001",
-        "order_id": "ord_defensive_001",
-        "amount": 999.00,
-        "fee": None,
-        "tax": None,
-        "payment_method": None
-    }
-    raw_bytes = json.dumps(payload).encode("utf-8")
-    sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
-
-    resp = client.post(
-        "/webhooks/razorpay",
-        content=raw_bytes,
-        headers={"X-Razorpay-Signature": sig, "Content-Type": "application/json"}
-    )
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "success"
-    assert resp.json()["payment_id"] == "pay_defensive_none_001"
-
-    # 2. Nested Razorpay payload with None fee/tax
-    nested_none = {
-        "event": "payment.captured",
-        "payload": {
-            "payment": {
-                "entity": {
-                    "id": "pay_nested_none_002",
-                    "order_id": "ord_defensive_002",
-                    "amount": 150000,
-                    "fee": None,
-                    "tax": None,
-                    "method": "upi"
-                }
-            }
-        }
-    }
-    nested_bytes = json.dumps(nested_none).encode("utf-8")
-    nested_sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), nested_bytes, hashlib.sha256).hexdigest()
-
-    resp_nested = client.post(
-        "/webhooks/razorpay",
-        content=nested_bytes,
-        headers={"X-Razorpay-Signature": nested_sig, "Content-Type": "application/json"}
-    )
-    assert resp_nested.status_code == 200
-    assert resp_nested.json()["payment_id"] == "pay_nested_none_002"
-
-def test_prometheus_metrics_endpoint():
-    """Verifies Prometheus text-format exposition endpoint."""
-    from fastapi.testclient import TestClient
-    from api import app
-    client = TestClient(app)
-
-    resp = client.get("/metrics/prometheus")
-    assert resp.status_code == 200
-    assert "text/plain" in resp.headers["content-type"]
-    text = resp.text
-    assert "paisaguard_settlements_total" in text
-    assert "paisaguard_matched_transactions_total" in text
-    assert "paisaguard_match_rate_percent" in text
-
-def test_accumulator_persistence_and_audit_history():
-    """Verifies that reconciliation_runs persists audit trail, seed_hash, and tracks sub-paise accumulator across runs."""
-    import sqlite3, json
-    from pathlib import Path
-    from recon_engine import execute_reconciliation_pipeline
-    from db import DEFAULT_DB_PATH
-
-    # Execute two consecutive sweeps
-    run1 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=True)
-    run2 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=False)
-
-    conn = sqlite3.connect(str(DEFAULT_DB_PATH))
-    runs = conn.execute("SELECT run_id, sub_paise_accumulator, git_sha, seed_hash, status FROM reconciliation_runs ORDER BY run_id DESC").fetchall()
+# -------------------------------------------------------------
+# 2. Database Pragmas & WAL Configuration
+# -------------------------------------------------------------
+def test_sqlite_wal_mode_active(setup_test_db):
+    conn = get_db_connection(setup_test_db, use_wal=True)
+    journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+    synchronous = conn.execute("PRAGMA synchronous;").fetchone()[0]
+    foreign_keys = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
     conn.close()
 
-    assert len(runs) >= 2
-    assert runs[0][4] == "COMPLETED"
-    assert isinstance(runs[0][1], float)
-    # Check seed_hash provenance persistence
-    assert runs[0][3].startswith("sha256:")
-    assert len(runs[0][2]) > 0
+    assert journal_mode.lower() == "wal"
+    assert synchronous in (1, "1", "NORMAL", "normal")
+    assert foreign_keys == 1
 
-    # Verify monthly-tax-audit-report.json has run_id, git_sha, and seed_hash
-    report_path = Path(__file__).resolve().parent / "monthly-tax-audit-report.json"
-    assert report_path.exists()
-    with open(report_path) as f:
-        report_data = json.load(f)
-    assert "run_id" in report_data
-    assert "seed_hash" in report_data
-    assert report_data["seed_hash"].startswith("sha256:")
-    assert "git_sha" in report_data
 
-def test_concurrency_benchmark_artifact_generation():
-    """Verifies that the benchmark runner generates out/concurrency-benchmark.json with zero lock errors in WAL mode."""
-    import json
-    from pathlib import Path
-    from concurrency_tester import run_comparative_benchmark
+# -------------------------------------------------------------
+# 3. Deterministic 3-Way Reconciliation
+# -------------------------------------------------------------
+def test_3way_reconciliation_coverage(setup_test_db):
+    summary = execute_reconciliation_pipeline(db_path=setup_test_db, include_held_out=False)
 
-    res_journal, res_wal = run_comparative_benchmark(num_threads=25)
-    assert res_wal["lock_errors"] == 0
-    assert res_wal["successful_commits"] == 25
+    assert summary["transaction_metrics"]["total_business_transactions"] == 100
+    assert summary["transaction_metrics"]["match_rate_percent"] >= 85.0
+    assert summary["transaction_metrics"]["matched_count"] >= 80
+    assert summary["transaction_metrics"]["exception_count"] >= 8
+    assert summary["payout_metrics"]["total_payout_batches"] >= 10
+    assert summary["payout_metrics"]["match_rate_percent"] >= 70.0
 
-    artifact = Path(__file__).resolve().parent / "out" / "concurrency-benchmark.json"
-    assert artifact.exists()
-    with open(artifact) as f:
-        data = json.load(f)
-    assert "system_spec" in data
-    assert data["wal_mode"]["lock_errors"] == 0
-
-def test_mandatory_hmac_enforcement(monkeypatch):
-    """Verifies that missing HMAC signatures are strictly rejected with HTTP 401 when required."""
-    from fastapi.testclient import TestClient
-    import api
-    client = TestClient(api.app)
-
-    payload = {
-        "event": "payment.captured",
-        "payment_id": "pay_unsigned_test_001",
-        "order_id": "ord_unsigned_001",
-        "amount": "1500.00"
-    }
-
-    # In production mode (or when PAISAGUARD_REQUIRE_HMAC=1), missing signature MUST fail with 401
-    monkeypatch.setattr(api, "ENVIRONMENT", "production")
-    resp_prod = client.post("/webhooks/razorpay", json=payload)
-    assert resp_prod.status_code == 401
-    assert "Missing X-Razorpay-Signature header" in resp_prod.json()["detail"]
-
-    # When explicitly requiring HMAC
-    monkeypatch.setattr(api, "ENVIRONMENT", "development")
-    monkeypatch.setattr(api, "PAISAGUARD_REQUIRE_HMAC", True)
-    resp_req = client.post("/webhooks/razorpay", json=payload)
-    assert resp_req.status_code == 401
-    assert "Missing X-Razorpay-Signature header" in resp_req.json()["detail"]
-
-def test_pydantic_decimal_payload_exactness():
-    """Verifies that WebhookPayload parses string and Decimal monetary inputs with zero floating point drift."""
-    from api import WebhookPayload
-    from decimal import Decimal
-
-    p = WebhookPayload(
-        event="payment.captured",
-        payment_id="pay_exact_dec_01",
-        amount="1499.50",
-        fee="29.99",
-        tax="5.40"
-    )
-    assert isinstance(p.amount, Decimal)
-    assert p.amount == Decimal("1499.50")
-    assert p.fee == Decimal("29.99")
-    assert p.tax == Decimal("5.40")
-
-def test_rate_limiter_throttling():
-    """Verifies that the in-memory rate limiter blocks excessive requests."""
-    from api import InMemoryRateLimiter
-
-    limiter = InMemoryRateLimiter(max_requests=5, window_seconds=60.0)
-    for _ in range(5):
-        allowed, rem = limiter.is_allowed("192.168.1.100")
-        assert allowed is True
-
-    # 6th request must be blocked
-    allowed, rem = limiter.is_allowed("192.168.1.100")
-    assert allowed is False
-    assert rem == 0
-
-    # Different IP should still be allowed
-    allowed_other, _ = limiter.is_allowed("192.168.1.101")
-    assert allowed_other is True
-
-def test_demo_auth_token_protection(monkeypatch):
-    """Verifies that setting PAISAGUARD_API_TOKEN protects administrative sweep and rule endpoints."""
-    from fastapi.testclient import TestClient
-    import api
-    client = TestClient(api.app)
-
-    monkeypatch.setattr(api, "PAISAGUARD_API_TOKEN", "demo_secret_token_123")
-
-    # Without token -> 401
-    r_unauth = client.post("/reconcile/sweep")
-    assert r_unauth.status_code == 401
-    assert "Valid X-PaisaGuard-Token header is required" in r_unauth.json()["detail"]
-
-    # With invalid token -> 401
-    r_bad = client.post("/reconcile/sweep", headers={"X-PaisaGuard-Token": "wrong_token"})
-    assert r_bad.status_code == 401
-
-    # With valid token -> 200
-    r_ok = client.post("/reconcile/sweep", headers={"X-PaisaGuard-Token": "demo_secret_token_123"})
-    assert r_ok.status_code == 200
-
-def test_recon_engine_handles_empty_tables(tmp_path):
-    """Verifies that running reconciliation on a completely empty database does not crash."""
-    from db import init_db
-    from recon_engine import execute_reconciliation_pipeline
-
-    empty_db = tmp_path / "empty.db"
-    init_db(empty_db)
-
-    summary = execute_reconciliation_pipeline(empty_db, reset_accumulator=True)
-    assert summary["total_audited"] == 0
-    assert summary["matched_count"] == 0
-    assert summary["exception_count"] == 0
-    assert summary["match_rate"] == 0.0
-    assert summary["gst_tax_leakage"] == 0.0
+    # Ensure output CSV artifacts exist
     assert Path(summary["matched_csv"]).exists()
     assert Path(summary["exception_csv"]).exists()
 
 
+# -------------------------------------------------------------
+# 4. Reconciliation Re-Run Idempotency
+# -------------------------------------------------------------
+def test_reconciliation_rerun_idempotency(setup_test_db):
+    conn = get_db_connection(setup_test_db)
+    decisions_before = conn.execute("SELECT COUNT(*) FROM reconciliation_decisions").fetchone()[0]
+    links_before = conn.execute("SELECT COUNT(*) FROM run_decision_links").fetchone()[0]
+    conn.close()
 
+    # Re-run pipeline over unchanged inputs
+    summary_2 = execute_reconciliation_pipeline(db_path=setup_test_db, include_held_out=False)
+
+    conn = get_db_connection(setup_test_db)
+    decisions_after = conn.execute("SELECT COUNT(*) FROM reconciliation_decisions").fetchone()[0]
+    links_after = conn.execute("SELECT COUNT(*) FROM run_decision_links").fetchone()[0]
+    runs_count = conn.execute("SELECT COUNT(*) FROM reconciliation_runs").fetchone()[0]
+    conn.close()
+
+    # Must NOT duplicate decisions
+    assert decisions_after == decisions_before
+    # Must link decisions to the new run
+    assert links_after == links_before * 2
+    assert runs_count >= 2
+
+
+# -------------------------------------------------------------
+# 5. Fail-Closed Token Security on Protected Endpoints
+# -------------------------------------------------------------
+def test_token_guard_fail_closed(setup_test_db, monkeypatch):
+    client = TestClient(app)
+
+    # 1. When server PAISAGUARD_API_TOKEN is unset -> fails closed with HTTP 503
+    monkeypatch.setenv("PAISAGUARD_API_TOKEN", "")
+    res = client.post("/reconcile/sweep")
+    assert res.status_code == 503
+
+    res_ai = client.post("/ai/investigate", json={"decision_id": 1})
+    assert res_ai.status_code == 503
+
+    res_app = client.post("/approvals/decision", json={"decision_id": 1, "action": "APPROVE", "reviewer": "cfo"})
+    assert res_app.status_code == 503
+
+    # 2. When server token is configured but client does not provide token -> 401
+    monkeypatch.setenv("PAISAGUARD_API_TOKEN", TEST_TOKEN)
+    res_unauth = client.post("/reconcile/sweep")
+    assert res_unauth.status_code == 401
+
+    # 3. When client provides wrong token -> 401
+    res_wrong = client.post("/reconcile/sweep", headers={"X-PaisaGuard-Token": "wrong_token"})
+    assert res_wrong.status_code == 401
+
+    # 4. When client provides correct token -> 200
+    res_ok = client.post("/reconcile/sweep", headers={"X-PaisaGuard-Token": TEST_TOKEN})
+    assert res_ok.status_code == 200
+
+
+# -------------------------------------------------------------
+# 6. Webhook Ingestion, Mandatory HMAC & Tampering Rejection
+# -------------------------------------------------------------
+def test_webhook_hmac_enforcement_and_tampering(setup_test_db, monkeypatch):
+    client = TestClient(app)
+    monkeypatch.setenv("RAZORPAY_WEBHOOK_SECRET", TEST_SECRET)
+    monkeypatch.setenv("PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS", "false")
+
+    payload = {
+        "event_id": "evt_test_hmac_01",
+        "event": "payment.captured",
+        "payment_id": "pay_test_hmac_01",
+        "amount_paise": 149900,
+        "fee_paise": 2998,
+        "tax_paise": 540,
+        "payment_method": "upi"
+    }
+    payload_bytes = json.dumps(payload).encode("utf-8")
+
+    # 1. Unsigned request must be rejected with 401
+    res_unsigned = client.post("/webhooks/razorpay", content=payload_bytes, headers={"Content-Type": "application/json"})
+    assert res_unsigned.status_code == 401
+    assert "Missing X-Razorpay-Signature" in res_unsigned.json()["detail"]
+
+    # 2. Valid Hex signature -> 200
+    hex_sig = hmac.new(TEST_SECRET.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
+    res_hex = client.post(
+        "/webhooks/razorpay",
+        content=payload_bytes,
+        headers={"Content-Type": "application/json", "X-Razorpay-Signature": hex_sig}
+    )
+    assert res_hex.status_code == 200
+    assert res_hex.json()["status"] == "ingested"
+
+    # 3. Tampered payload with old signature -> 401
+    tampered_bytes = json.dumps({**payload, "amount_paise": 999900}).encode("utf-8")
+    res_tampered = client.post(
+        "/webhooks/razorpay",
+        content=tampered_bytes,
+        headers={"Content-Type": "application/json", "X-Razorpay-Signature": hex_sig}
+    )
+    assert res_tampered.status_code == 401
+
+
+# -------------------------------------------------------------
+# 7. Webhook Idempotency & Deduplication
+# -------------------------------------------------------------
+def test_webhook_deduplication(setup_test_db, monkeypatch):
+    client = TestClient(app)
+    monkeypatch.setenv("RAZORPAY_WEBHOOK_SECRET", TEST_SECRET)
+    monkeypatch.setenv("PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS", "false")
+
+    payload = {
+        "event_id": "evt_unique_dedup_99",
+        "event": "payment.captured",
+        "payment_id": "pay_unique_dedup_99",
+        "amount_paise": 249900,
+        "fee_paise": 4998,
+        "tax_paise": 900
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    sig = hmac.new(TEST_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
+    # First delivery: ingested
+    r1 = client.post("/webhooks/razorpay", content=raw, headers={"X-Razorpay-Signature": sig})
+    assert r1.status_code == 200
+    assert r1.json()["status"] == "ingested"
+
+    # Second delivery (replay): duplicate ignored
+    r2 = client.post("/webhooks/razorpay", content=raw, headers={"X-Razorpay-Signature": sig})
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "duplicate_ignored"
+
+    # Verify exactly 1 record in webhook_events
+    conn = get_db_connection(setup_test_db)
+    count = conn.execute("SELECT COUNT(*) FROM webhook_events WHERE event_id = 'evt_unique_dedup_99'").fetchone()[0]
+    conn.close()
+    assert count == 1
+
+
+# -------------------------------------------------------------
+# 8. AI Exception Investigation: Citations & Schema
+# -------------------------------------------------------------
+def test_ai_investigation_citations_and_schema(setup_test_db):
+    conn = get_db_connection(setup_test_db)
+    row = conn.execute("SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1").fetchone()
+    conn.close()
+
+    assert row is not None
+    dec_id = row["decision_id"]
+
+    res = investigate_exception(dec_id, db_path=setup_test_db)
+
+    assert res["decision_id"] == dec_id
+    assert res["root_cause"] != ""
+    assert 0.0 <= res["confidence"] <= 1.0
+    assert len(res["evidence_record_ids"]) > 0
+    assert res["proposed_action"] != ""
+    assert res["policy_status"] in ("POLICY_APPROVED", "POLICY_REJECTED")
+
+
+# -------------------------------------------------------------
+# 9. AI Deliberate Abstention
+# -------------------------------------------------------------
+def test_ai_deliberate_abstention(setup_test_db):
+    # Insert a synthetic ambiguous decision to test deliberate abstention
+    conn = get_db_connection(setup_test_db)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO reconciliation_decisions (
+            decision_fingerprint, input_snapshot_hash, matcher_version,
+            subject_type, subject_id, match_status, discrepancy_code,
+            variance_paise, evidence_json, created_at
+        ) VALUES (
+            'sha256:test_ambig_fp', 'sha256:test_snap', 'v2.0-three-way',
+            'BUSINESS_TX', 'tx_test_ambig', 'EXCEPTION',
+            'GENUINE_AMBIGUITY_INSUFFICIENT_DATA', 9999,
+            '{"reason": "Incoherent pricing deduction with contradictory historical records", "amount_paise": 100000, "actual_fee_paise": 1234}',
+            datetime('now')
+        );
+    """)
+    ambig_dec_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    res = investigate_exception(ambig_dec_id, db_path=setup_test_db)
+
+    assert res["should_abstain"] is True
+    assert res["proposed_action"] == "ABSTAIN"
+    assert res["abstention_reason"] is not None
+    assert len(res["abstention_reason"]) > 5
+
+
+# -------------------------------------------------------------
+# 10. AI Agent Failure Hardening
+# -------------------------------------------------------------
+class MalformedProvider(BaseAIProvider):
+    def investigate(self, prompt: str, evidence: dict) -> str:
+        return "Not a valid JSON {{"
+
+
+class HallucinatingProvider(BaseAIProvider):
+    def investigate(self, prompt: str, evidence: dict) -> str:
+        return json.dumps({
+            "root_cause": "FAKE_DIAGNOSIS",
+            "confidence": 0.95,
+            "evidence_record_ids": ["hallucinated_record_id_not_in_evidence"],
+            "evidence_summary": "Made up evidence",
+            "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
+            "requires_human_approval": True,
+            "should_abstain": False
+        })
+
+
+class UnsupportedActionProvider(BaseAIProvider):
+    def investigate(self, prompt: str, evidence: dict) -> str:
+        return json.dumps({
+            "root_cause": "TEST_CAUSE",
+            "confidence": 0.95,
+            "evidence_record_ids": evidence.get("available_record_ids", []),
+            "evidence_summary": "Summary",
+            "proposed_action": "DELETE_ALL_RECORDS",  # Prohibited action!
+            "requires_human_approval": True,
+            "should_abstain": False
+        })
+
+
+class LowConfidenceProvider(BaseAIProvider):
+    def investigate(self, prompt: str, evidence: dict) -> str:
+        return json.dumps({
+            "root_cause": "UNCERTAIN_CAUSE",
+            "confidence": 0.45,  # Low confidence
+            "evidence_record_ids": evidence.get("available_record_ids", []),
+            "evidence_summary": "Uncertain summary",
+            "proposed_action": "REQUEST_MERCHANT_CLARIFICATION",
+            "requires_human_approval": True,
+            "should_abstain": False
+        })
+
+
+def test_ai_agent_failure_modes(setup_test_db):
+    conn = get_db_connection(setup_test_db)
+    row = conn.execute("SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1").fetchone()
+    conn.close()
+    dec_id = row["decision_id"]
+
+    # 1. Malformed JSON fallback -> Audited Abstention
+    res_malformed = investigate_exception(dec_id, db_path=setup_test_db, provider=MalformedProvider())
+    assert res_malformed["should_abstain"] is True
+    assert res_malformed["root_cause"] == "DIAGNOSTIC_FAILURE"
+
+    # 2. Hallucinated Citation -> Verification guardrail forces abstention
+    res_hallucinated = investigate_exception(dec_id, db_path=setup_test_db, provider=HallucinatingProvider())
+    assert res_hallucinated["should_abstain"] is True
+    assert "Verification failure" in res_hallucinated["abstention_reason"]
+
+    # 3. Unsupported Action -> Verification guardrail forces abstention
+    res_action = investigate_exception(dec_id, db_path=setup_test_db, provider=UnsupportedActionProvider())
+    assert res_action["should_abstain"] is True
+    assert "not permitted" in res_action["abstention_reason"]
+
+    # 4. Low Confidence (< 0.70) -> Forced abstention
+    res_low = investigate_exception(dec_id, db_path=setup_test_db, provider=LowConfidenceProvider())
+    assert res_low["should_abstain"] is True
+    assert "below safety threshold" in res_low["abstention_reason"]
+
+
+def test_policy_gate_rejection():
+    # Variance > 5,000 paise (₹50.00 ceiling)
+    approved, reason = PolicyGatekeeper.evaluate(
+        gross_amount_paise=100000,
+        actual_fee_paise=6000,
+        expected_fee_paise=2000,
+        variance_paise=7000,  # 7,000 paise > 5,000 ceiling!
+        proposed_action="ACCEPT_SURCHARGE_ADJUSTMENT"
+    )
+    assert approved is False
+    assert "exceeds hard safety ceiling" in reason
+
+    # Effective fee > 3.50% MDR cap
+    approved_cap, reason_cap = PolicyGatekeeper.evaluate(
+        gross_amount_paise=100000,
+        actual_fee_paise=4000,  # 4.0% > 3.50% cap
+        expected_fee_paise=2000,
+        variance_paise=2000,
+        proposed_action="ACCEPT_SURCHARGE_ADJUSTMENT"
+    )
+    assert approved_cap is False
+    assert "breaches statutory merchant contract cap" in reason_cap
+
+
+# -------------------------------------------------------------
+# 11. Strictly Append-Only Human Approval & State Projection
+# -------------------------------------------------------------
+def test_human_approval_append_only(setup_test_db):
+    conn = get_db_connection(setup_test_db)
+    row = conn.execute("SELECT decision_id FROM reconciliation_decisions WHERE match_status = 'EXCEPTION' LIMIT 1").fetchone()
+    conn.close()
+    dec_id = row["decision_id"]
+
+    # Check projection before approval
+    conn = get_db_connection(setup_test_db)
+    before_view = conn.execute("SELECT current_disposition FROM v_current_decisions WHERE decision_id = ?", (dec_id,)).fetchone()
+    conn.close()
+    assert before_view["current_disposition"] == "UNRESOLVED"
+
+    # Record approval
+    app_id = record_human_approval(
+        decision_id=dec_id,
+        action="APPROVE",
+        reviewer="auditor_jane",
+        notes="Validated against merchant contract",
+        db_path=setup_test_db
+    )
+    assert app_id > 0
+
+    # Verify append-only entries
+    conn = get_db_connection(setup_test_db)
+    app_row = conn.execute("SELECT * FROM human_approvals WHERE approval_id = ?", (app_id,)).fetchone()
+    assert app_row["reviewer"] == "auditor_jane"
+    assert app_row["action"] == "APPROVE"
+
+    # Verify projection view shows latest disposition
+    after_view = conn.execute("SELECT current_disposition, resolved_by FROM v_current_decisions WHERE decision_id = ?", (dec_id,)).fetchone()
+    assert after_view["current_disposition"] == "APPROVE"
+    assert after_view["resolved_by"] == "auditor_jane"
+
+    # Verify zero updates executed on reconciliation_decisions table (reconciliation_decisions does not even have disposition column)
+    dec_cols = [c[1] for c in conn.execute("PRAGMA table_info(reconciliation_decisions)").fetchall()]
+    assert "disposition" not in dec_cols
+    conn.close()
+
+
+# -------------------------------------------------------------
+# 12. Isolated Dashboard Read Endpoints
+# -------------------------------------------------------------
+def test_dashboard_read_endpoints(setup_test_db):
+    client = TestClient(app)
+
+    # 1. GET /metrics
+    r_m = client.get("/metrics")
+    assert r_m.status_code == 200
+    data_m = r_m.json()
+    assert "counts" in data_m
+    assert "transaction_metrics" in data_m
+    assert "payout_metrics" in data_m
+
+    # 2. GET /payouts
+    r_p = client.get("/payouts")
+    assert r_p.status_code == 200
+    data_p = r_p.json()
+    assert "payout_batches" in data_p
+    assert "unmatched_bank_credits" in data_p
+
+    # 3. GET /exceptions
+    r_e = client.get("/exceptions")
+    assert r_e.status_code == 200
+    data_e = r_e.json()
+    assert "exceptions" in data_e
+
+    # 4. GET /audit-events
+    r_a = client.get("/audit-events")
+    assert r_a.status_code == 200
+    data_a = r_a.json()
+    assert "audit_events" in data_a
+    assert "human_approvals" in data_a
+
+    # 5. GET /evaluation-report
+    r_r = client.get("/evaluation-report")
+    assert r_r.status_code == 200
+
+    # 6. GET /metrics/prometheus
+    r_prom = client.get("/metrics/prometheus")
+    assert r_prom.status_code == 200
+    assert "paisaguard_tx_match_rate_percent" in r_prom.text

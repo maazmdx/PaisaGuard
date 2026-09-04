@@ -92,18 +92,36 @@ class DeterministicMockProvider(BaseAIProvider):
                 "abstention_reason": "Conflicting transaction data with insufficient gateway audit history. Recommended for manual CFO escalation."
             })
 
-        # 2. Corporate card fee surcharge
-        if discrepancy in ("FEE_TAX_DISCREPANCY", "CORPORATE_CARD_SURCHARGE") or "corporate" in reason or "fee discrepancy" in reason:
-            return json.dumps({
-                "root_cause": "CORPORATE_CARD_SURCHARGE",
-                "confidence": 0.95,
-                "evidence_record_ids": available_ids,
-                "evidence_summary": f"Detected 50 bps fee surcharge ({variance_p} paise variance) matching commercial credit card interchange tier.",
-                "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
-                "requires_human_approval": True,
-                "should_abstain": False,
-                "abstention_reason": None
-            })
+        # 2. Fee discrepancy evaluation
+        if discrepancy in ("FEE_TAX_DISCREPANCY", "CORPORATE_CARD_SURCHARGE") or "fee discrepancy" in reason:
+            gross_p = evidence.get("gross_amount_paise") or evidence.get("amount_paise", 0)
+            actual_fee_p = evidence.get("actual_fee_paise", 0)
+            rate_bps = (actual_fee_p * 10000) // gross_p if gross_p > 0 else 0
+
+            # Commercial corporate card surcharge matches ~2.50% MDR (245 - 255 bps)
+            if 245 <= rate_bps <= 255:
+                return json.dumps({
+                    "root_cause": "CORPORATE_CARD_SURCHARGE",
+                    "confidence": 0.95,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": f"Detected 50 bps fee surcharge ({variance_p} paise variance) matching commercial credit card interchange tier (2.50% MDR).",
+                    "proposed_action": "ACCEPT_SURCHARGE_ADJUSTMENT",
+                    "requires_human_approval": True,
+                    "should_abstain": False,
+                    "abstention_reason": None
+                })
+            else:
+                # Ambiguous fee anomaly with no recognized tier -> deliberate abstention!
+                return json.dumps({
+                    "root_cause": "GENUINE_AMBIGUITY_INSUFFICIENT_DATA",
+                    "confidence": 0.50,
+                    "evidence_record_ids": available_ids,
+                    "evidence_summary": f"Incoherent fee deduction of {actual_fee_p} paise on gross {gross_p} paise ({rate_bps/100:.2f}% MDR). Does not match standard contract schedules.",
+                    "proposed_action": "ABSTAIN",
+                    "requires_human_approval": True,
+                    "should_abstain": True,
+                    "abstention_reason": "Non-standard fee deduction with no recognized contract schedule. Escalated for FinOps review."
+                })
 
         # 3. Delayed bank payout credit
         if discrepancy == "DELAYED_BANK_CREDIT" or "not yet arrived in bank" in reason:
@@ -295,6 +313,8 @@ def investigate_exception(
         "subject_id": row["subject_id"],
         "discrepancy_code": discrepancy_code,
         "variance_paise": variance_paise,
+        "gross_amount_paise": evidence_dict.get("amount_paise", evidence_dict.get("oms_amount_paise", 0)),
+        "actual_fee_paise": evidence_dict.get("actual_fee_paise", evidence_dict.get("fee_paise", 0)),
         "reason": evidence_dict.get("reason", ""),
         "available_record_ids": valid_ids
     }

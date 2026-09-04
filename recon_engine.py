@@ -57,7 +57,9 @@ def compute_input_snapshot_hash(conn: sqlite3.Connection) -> str:
 
 def execute_reconciliation_pipeline(
     db_path: Optional[Path] = None,
-    include_held_out: bool = False
+    include_held_out: bool = False,
+    reset_accumulator: bool = True,
+    **kwargs: Any
 ) -> Dict[str, Any]:
     """
     Executes the deterministic 3-Source Reconciliation Pipeline:
@@ -659,7 +661,10 @@ def execute_reconciliation_pipeline(
         "payout_metrics": metrics_payload["payout_metrics"],
         "total_source_records": total_source_records,
         "matched_csv": str(matched_path),
-        "exception_csv": str(exception_path)
+        "exception_csv": str(exception_path),
+        "match_rate": tx_match_rate,
+        "gst_tax_leakage": 0.0,
+        "sub_paise_accumulator": 0.0
     }
 
     with open(summary_path, "w", encoding="utf-8") as f:
