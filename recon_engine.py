@@ -1,362 +1,685 @@
+"""
+recon_engine.py — Deterministic 3-Source Financial Reconciliation Engine for PaisaGuard.
+
+Architectural Guarantees:
+1. 3-Source Reconciliation: OMS Orders -> Razorpay Settlements -> Bank Payout Credits.
+2. Canonical Currency: Pure integer paise across all operations. Zero float math.
+3. Polymorphic Subjects: Supports BUSINESS_TX, PAYOUT, and BANK_CREDIT subjects.
+4. Input Snapshot Hash & Decision Fingerprinting:
+   - Provenance snapshot hash across all input records.
+   - Decision fingerprint: sha256(snapshot + matcher_version + subject_type + subject_id).
+5. Append-Only Idempotency: Re-runs link to existing decisions without duplicating audit decisions.
+"""
+
 import os
+import sys
 import json
 import sqlite3
 import hashlib
 import pandas as pd
-from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from db import get_db_connection, get_db_cursor, DEFAULT_DB_PATH
-from money import to_decimal, round_curr, to_paise, paise_to_rupees, calc_mdr_fee_and_tax
+from typing import Dict, Any, List, Optional, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from db import get_db_connection, get_db_cursor, get_db_path, log_audit_event
+from money import require_paise, calc_mdr_fee_and_tax_paise, format_paise_inr, paise_to_rupees
+
 OUT_DIR = BASE_DIR / "out"
+MATCHER_VERSION = "v2.0-three-way"
 
 
-def compute_dataset_seed_hash(conn: sqlite3.Connection) -> str:
+def compute_input_snapshot_hash(conn: sqlite3.Connection) -> str:
     """
-    Computes a deterministic SHA-256 fingerprint across operational inputs (OMS orders and settlements).
-    Guarantees end-to-end dataset provenance and tamper-evident auditability.
-
-    Note on Entropy Slicing:
-    We truncate the SHA-256 hexdigest to 32 hex characters (128 bits of entropy).
-    This provides 2^64 birthday attack collision resistance — mathematically impossible
-    to collide across billions of financial datasets — while ensuring compact database
-    indexing and clean formatting in CSV and JSON audit reports.
+    Computes a deterministic SHA-256 fingerprint across all 3 source tables.
+    Uses immutable source_payload_hash values to guarantee data provenance.
     """
     hasher = hashlib.sha256()
     cursor = conn.cursor()
+
     # Hash sorted OMS orders
-    for row in cursor.execute("SELECT order_id, gross_amount, customer_id, created_at FROM oms_orders ORDER BY order_id ASC"):
-        hasher.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}|".encode("utf-8"))
+    for row in cursor.execute("SELECT order_id, source_payload_hash FROM oms_orders ORDER BY order_id ASC"):
+        hasher.update(f"oms:{row[0]}:{row[1]}|".encode("utf-8"))
+
     # Hash sorted Razorpay settlements
-    for row in cursor.execute("SELECT payment_id, order_id, amount, fee, tax, net_amount FROM razorpay_settlements ORDER BY payment_id ASC"):
-        hasher.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}:{row[4]}:{row[5]}|".encode("utf-8"))
-    return f"sha256:{hasher.hexdigest()[:32]}"
+    for row in cursor.execute("SELECT payment_id, source_payload_hash FROM razorpay_settlements ORDER BY payment_id ASC"):
+        hasher.update(f"rzp:{row[0]}:{row[1]}|".encode("utf-8"))
+
+    # Hash sorted Bank payout credits
+    for row in cursor.execute("SELECT credit_id, source_payload_hash FROM bank_payout_credits ORDER BY credit_id ASC"):
+        hasher.update(f"bnk:{row[0]}:{row[1]}|".encode("utf-8"))
+
+    return f"sha256:{hasher.hexdigest()}"
 
 
-def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accumulator: bool = False) -> dict:
+def execute_reconciliation_pipeline(
+    db_path: Optional[Path] = None,
+    include_held_out: bool = False
+) -> Dict[str, Any]:
     """
-    Executes the deterministic 4-Pass Reconciliation Engine:
-      Pass 1: Key & Gross Amount Verification (OMS vs Razorpay)
-      Pass 2: Sub-Paise Rounding Accumulator & Contract MDR Validation
-      Pass 3: Exception Routing & Dynamic Rule Resolution
-      Pass 4: Daily-to-Monthly GST ITC Safeguard Audit
-    Exports:
-      - out/final-matched-ledger.csv
-      - out/final-exception-queue.csv
-      - out/monthly-tax-audit-report.json
+    Executes the deterministic 3-Source Reconciliation Pipeline:
+      Pass 1: OMS Orders <-> Razorpay Settlements (Transaction Level)
+      Pass 2: Razorpay Settlements <-> Bank Payout Credits (Payout Batch Level)
+      Pass 3: Scoped Rule Evaluation (Dynamic Pre-approved Overrides)
+      Pass 4: Append-Only Idempotent Persistence & Output Generation
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    conn = get_db_connection(db_path)
-    
-    # Ensure reconciliation_runs schema and migration for seed_hash
-    with get_db_cursor(db_path) as cursor:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS reconciliation_runs (
-                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_timestamp TEXT NOT NULL,
-                git_sha TEXT DEFAULT 'local',
-                seed_hash TEXT DEFAULT 'sha256:none',
-                total_audited INTEGER NOT NULL,
-                matched_count INTEGER NOT NULL,
-                exception_count INTEGER NOT NULL,
-                match_rate REAL NOT NULL,
-                sub_paise_accumulator REAL NOT NULL,
-                gst_daily_aggregate REAL NOT NULL,
-                gst_monthly_invoice REAL NOT NULL,
-                gst_tax_leakage REAL NOT NULL,
-                status TEXT NOT NULL
-            );
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_recon_runs_ts ON reconciliation_runs(run_timestamp);")
-        cursor.execute("PRAGMA table_info(reconciliation_runs);")
-        cols = [col[1] for col in cursor.fetchall()]
-        if "seed_hash" not in cols:
-            cursor.execute("ALTER TABLE reconciliation_runs ADD COLUMN seed_hash TEXT DEFAULT 'sha256:none';")
+    target_db = db_path if db_path else get_db_path()
 
-    # Compute deterministic dataset seed hash
-    seed_hash = compute_dataset_seed_hash(conn)
+    conn = get_db_connection(target_db)
+    input_snapshot_hash = compute_input_snapshot_hash(conn)
     git_sha = os.environ.get("GIT_SHA", os.environ.get("GITHUB_SHA", "local"))[:40]
+    run_timestamp = datetime.now(timezone.utc).isoformat()
 
-    # 1. Load operational datasets into DataFrames with strict deterministic ordering
-    df_oms = pd.read_sql("SELECT * FROM oms_orders ORDER BY order_id ASC", conn)
-    df_settle = pd.read_sql("SELECT * FROM razorpay_settlements ORDER BY payment_id ASC", conn)
-    df_rules = pd.read_sql("SELECT * FROM resolved_rules ORDER BY rule_id ASC", conn)
-    df_gst_inv = pd.read_sql("SELECT * FROM gst_monthly_invoices ORDER BY invoice_id ASC", conn)
-
-    # Read latest accumulator audit state for continuous multi-cycle reconciliation
-    if reset_accumulator:
-        rolling_sub_paise_drift = Decimal("0.0000")
+    # Load operational datasets
+    if include_held_out:
+        df_oms = pd.read_sql("SELECT * FROM oms_orders ORDER BY order_id ASC", conn)
+        df_settle = pd.read_sql("SELECT * FROM razorpay_settlements ORDER BY payment_id ASC", conn)
     else:
-        cursor = conn.cursor()
-        prior_run = cursor.execute(
-            "SELECT sub_paise_accumulator FROM reconciliation_runs ORDER BY run_id DESC LIMIT 1"
-        ).fetchone()
-        if prior_run and prior_run[0] is not None:
-            rolling_sub_paise_drift = to_decimal(prior_run[0])
-        else:
-            ledger_drift = cursor.execute(
-                "SELECT SUM(sub_paise_drift) FROM reconciliation_ledger"
-            ).fetchone()
-            rolling_sub_paise_drift = to_decimal(ledger_drift[0]) if ledger_drift and ledger_drift[0] is not None else Decimal("0.0000")
-    
+        # Exclude held-out evaluation transactions from standard operational runs
+        df_oms = pd.read_sql("SELECT * FROM oms_orders WHERE business_tx_id NOT LIKE 'tx_eval_%' ORDER BY order_id ASC", conn)
+        df_settle = pd.read_sql("SELECT * FROM razorpay_settlements WHERE business_tx_id NOT LIKE 'tx_eval_%' ORDER BY payment_id ASC", conn)
+
+    df_bank = pd.read_sql("SELECT * FROM bank_payout_credits ORDER BY credit_id ASC", conn)
+    df_rules = pd.read_sql("SELECT * FROM resolved_rules WHERE status = 'ACTIVE' ORDER BY rule_id ASC", conn)
     conn.close()
 
-    # Pre-index rules by exception pattern or order ID for O(1) matching
-    rule_map = {}
+    # Index rules by (scope_field, scope_value)
+    active_rules = []
     for _, r in df_rules.iterrows():
-        rule_map[r["pattern_key"]] = r.to_dict()
+        active_rules.append(r.to_dict())
 
-    matched_records = []
-    exception_records = []
-    ledger_entries = []
-
+    # Map records for O(1) matching
+    oms_by_tx = {row["business_tx_id"]: row for _, row in df_oms.iterrows() if row["business_tx_id"]}
+    oms_by_order = {row["order_id"]: row for _, row in df_oms.iterrows() if row["order_id"]}
+    settle_by_tx = {row["business_tx_id"]: row for _, row in df_settle.iterrows() if row["business_tx_id"]}
     settle_by_order = {row["order_id"]: row for _, row in df_settle.iterrows() if row["order_id"]}
-    oms_by_order = {row["order_id"]: row for _, row in df_oms.iterrows()}
+    bank_by_payout = {row["payout_id"]: row for _, row in df_bank.iterrows() if row["payout_id"]}
 
-    # Contract parameters: Standard 2.0% MDR + 18% GST
-    contract_mdr_rate = Decimal("0.020")
-    gst_rate = Decimal("0.18")
+    all_tx_ids = sorted(list(set(list(oms_by_tx.keys()) + list(settle_by_tx.keys()))))
 
-    recon_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    decisions_to_record = []
+    matched_records_export = []
+    exception_records_export = []
 
-    # --- PASS 1 & 2: Process OMS orders against Razorpay settlements ---
-    for order_id, oms_row in oms_by_order.items():
-        gross_amt = to_decimal(oms_row["gross_amount"])
-        
-        if order_id not in settle_by_order:
-            # Unsettled transaction
-            exc = {
+    # -------------------------------------------------------------
+    # PASS 1 & 3: OMS <-> Settlement (Transaction Level)
+    # -------------------------------------------------------------
+    tx_matched_count = 0
+    tx_exception_count = 0
+
+    for tx_id in all_tx_ids:
+        oms_row = oms_by_tx.get(tx_id)
+        settle_row = settle_by_tx.get(tx_id)
+
+        # 1. Unsettled OMS order
+        if settle_row is None:
+            tx_exception_count += 1
+            order_id = oms_row["order_id"]
+            amt_p = require_paise(int(oms_row["amount_paise"]))
+            evidence = {
+                "business_tx_id": tx_id,
                 "order_id": order_id,
-                "payment_id": "N/A",
-                "exception_code": "UNSETTLED_PENDING",
-                "variance": float(gross_amt),
-                "exception_msg": f"Order {order_id} captured in OMS but pending gateway settlement.",
-                "status": "PENDING"
+                "amount_paise": amt_p,
+                "created_at": oms_row["created_at"],
+                "variance_paise": amt_p,
+                "reason": f"OMS order {order_id} captured but no settlement recorded in payment gateway feed."
             }
-            exception_records.append(exc)
-            ledger_entries.append((
-                order_id, None, "EXCEPTION", float(gross_amt), 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, "UNSETTLED_PENDING", exc["exception_msg"], recon_timestamp
-            ))
+            decisions_to_record.append({
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "business_tx_id": tx_id,
+                "order_id": order_id,
+                "payment_id": None,
+                "payout_id": None,
+                "credit_id": None,
+                "match_status": "EXCEPTION",
+                "discrepancy_code": "UNSETTLED_OMS_ORDER",
+                "variance_paise": amt_p,
+                "evidence": evidence
+            })
+            exception_records_export.append({
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "discrepancy_code": "UNSETTLED_OMS_ORDER",
+                "variance_paise": amt_p,
+                "variance_inr": format_paise_inr(amt_p),
+                "summary": evidence["reason"]
+            })
             continue
 
-        settle_row = settle_by_order[order_id]
-        pay_id = settle_row["payment_id"]
-        settle_amt = to_decimal(settle_row["amount"])
-        actual_fee = to_decimal(settle_row["fee"])
-        actual_tax = to_decimal(settle_row["tax"])
-        actual_net = to_decimal(settle_row["net_amount"])
+        # 2. Orphan settlement (in Razorpay, missing in OMS)
+        if oms_row is None:
+            tx_exception_count += 1
+            pay_id = settle_row["payment_id"]
+            s_amt_p = require_paise(int(settle_row["amount_paise"]))
+            evidence = {
+                "business_tx_id": tx_id,
+                "payment_id": pay_id,
+                "payout_id": settle_row.get("payout_id"),
+                "amount_paise": s_amt_p,
+                "settled_at": settle_row["settled_at"],
+                "variance_paise": s_amt_p,
+                "reason": f"Payment {pay_id} settled by gateway without corresponding internal OMS order."
+            }
+            decisions_to_record.append({
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "business_tx_id": tx_id,
+                "order_id": settle_row.get("order_id"),
+                "payment_id": pay_id,
+                "payout_id": settle_row.get("payout_id"),
+                "credit_id": None,
+                "match_status": "EXCEPTION",
+                "discrepancy_code": "ORPHAN_SETTLEMENT",
+                "variance_paise": s_amt_p,
+                "evidence": evidence
+            })
+            exception_records_export.append({
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "discrepancy_code": "ORPHAN_SETTLEMENT",
+                "variance_paise": s_amt_p,
+                "variance_inr": format_paise_inr(s_amt_p),
+                "summary": evidence["reason"]
+            })
+            continue
 
-        # Check gross amount mismatch
-        amt_diff = abs(gross_amt - settle_amt)
-        if amt_diff > Decimal("0.01"):
-            exc = {
+        # Both OMS and Settlement exist
+        order_id = oms_row["order_id"]
+        pay_id = settle_row["payment_id"]
+        payout_id = settle_row.get("payout_id")
+        oms_amt_p = require_paise(int(oms_row["amount_paise"]))
+        settle_amt_p = require_paise(int(settle_row["amount_paise"]))
+        actual_fee_p = require_paise(int(settle_row["fee_paise"]))
+        actual_tax_p = require_paise(int(settle_row["tax_paise"]))
+        actual_net_p = require_paise(int(settle_row["net_paise"]))
+        method = settle_row.get("payment_method", "upi")
+
+        # Check gross amount mismatch (partial refund or under-settlement)
+        if oms_amt_p != settle_amt_p:
+            tx_exception_count += 1
+            variance_p = abs(oms_amt_p - settle_amt_p)
+            evidence = {
+                "business_tx_id": tx_id,
                 "order_id": order_id,
                 "payment_id": pay_id,
-                "exception_code": "AMOUNT_MISMATCH",
-                "variance": float(amt_diff),
-                "exception_msg": f"Gross amount mismatch: OMS ₹{gross_amt:.2f} vs Settlement ₹{settle_amt:.2f}.",
-                "status": "DISCREPANCY"
+                "oms_amount_paise": oms_amt_p,
+                "settle_amount_paise": settle_amt_p,
+                "variance_paise": variance_p,
+                "reason": f"Gross amount mismatch: OMS ₹{paise_to_rupees(oms_amt_p)} vs Settlement ₹{paise_to_rupees(settle_amt_p)}."
             }
-            exception_records.append(exc)
-            ledger_entries.append((
-                order_id, pay_id, "EXCEPTION", float(gross_amt), float(settle_amt),
-                0.0, float(actual_fee), 0.0, 0.0, float(actual_tax), 0.0, 0.0,
-                "AMOUNT_MISMATCH", exc["exception_msg"], recon_timestamp
-            ))
+            decisions_to_record.append({
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "business_tx_id": tx_id,
+                "order_id": order_id,
+                "payment_id": pay_id,
+                "payout_id": payout_id,
+                "credit_id": None,
+                "match_status": "EXCEPTION",
+                "discrepancy_code": "PARTIAL_REFUND_MISMATCH",
+                "variance_paise": variance_p,
+                "evidence": evidence
+            })
+            exception_records_export.append({
+                "subject_type": "BUSINESS_TX",
+                "subject_id": tx_id,
+                "discrepancy_code": "PARTIAL_REFUND_MISMATCH",
+                "variance_paise": variance_p,
+                "variance_inr": format_paise_inr(variance_p),
+                "summary": evidence["reason"]
+            })
             continue
 
-        # Mathematical contract validation with sub-paise accumulator
-        expected_fee, expected_tax, _, drift = calc_mdr_fee_and_tax(gross_amt, contract_mdr_rate, gst_rate)
-        rolling_sub_paise_drift += drift
+        # Mathematical contract validation (Standard 2.0% MDR + 18% GST)
+        expected_fee_p, expected_tax_p = calc_mdr_fee_and_tax_paise(oms_amt_p, mdr_bps=200, gst_bps=1800)
+        fee_variance_p = actual_fee_p - expected_fee_p
+        tax_variance_p = actual_tax_p - expected_tax_p
 
-        fee_diff = actual_fee - expected_fee
-        tax_diff = actual_tax - expected_tax
-
-        # PASS 3: Contract Fee Discrepancy & Rules Engine Evaluation
-        if abs(fee_diff) > Decimal("0.01"):
-            # Check if resolved by rules engine
-            rule_matched = None
-            for key, rule in rule_map.items():
-                if key in [order_id, pay_id, "FEE_DEDUCTION"] or "corporate" in key.lower():
-                    rule_matched = rule
+        # PASS 3: Fee Discrepancy & Scoped Rule Evaluation
+        if fee_variance_p != 0:
+            # Check for scoped rule match (no fuzzy string matching)
+            matched_rule = None
+            for rule in active_rules:
+                if rule["scope_field"] == "payment_method" and rule["scope_value"] == method:
+                    matched_rule = rule
                     break
 
-            if rule_matched is not None:
-                matched_records.append({
+            if matched_rule:
+                tx_matched_count += 1
+                evidence = {
+                    "business_tx_id": tx_id,
                     "order_id": order_id,
                     "payment_id": pay_id,
-                    "gross_amount": float(gross_amt),
-                    "settled_amount": float(settle_amt),
-                    "fee": float(actual_fee),
-                    "tax": float(actual_tax),
-                    "net_amount": float(actual_net),
-                    "sub_paise_drift": float(drift),
-                    "status": "RULE_OVERRIDDEN",
-                    "settled_at": settle_row["settled_at"]
-                })
-                ledger_entries.append((
-                    order_id, pay_id, "RULE_OVERRIDDEN", float(gross_amt), float(settle_amt),
-                    float(expected_fee), float(actual_fee), float(fee_diff),
-                    float(expected_tax), float(actual_tax), float(tax_diff),
-                    float(drift), "FEE_OVERRIDE_APPLIED", rule_matched["description"], recon_timestamp
-                ))
-            else:
-                exc = {
-                    "order_id": order_id,
-                    "payment_id": pay_id,
-                    "exception_code": "FEE_DEDUCTION",
-                    "variance": float(fee_diff),
-                    "exception_msg": f"Gateway deducted ₹{actual_fee:.2f} fee (expected ₹{expected_fee:.2f} @ 2.0% MDR). Suspected Corporate Card Rate (2.5%).",
-                    "status": "UNRESOLVED"
+                    "payout_id": payout_id,
+                    "amount_paise": oms_amt_p,
+                    "fee_paise": actual_fee_p,
+                    "expected_fee_paise": expected_fee_p,
+                    "fee_variance_paise": fee_variance_p,
+                    "rule_id": matched_rule["rule_id"],
+                    "rule_action": matched_rule["action"],
+                    "reason": f"Contract fee discrepancy resolved by pre-approved rule {matched_rule['rule_id']} ({matched_rule['description']})."
                 }
-                exception_records.append(exc)
-                ledger_entries.append((
-                    order_id, pay_id, "EXCEPTION", float(gross_amt), float(settle_amt),
-                    float(expected_fee), float(actual_fee), float(fee_diff),
-                    float(expected_tax), float(actual_tax), float(tax_diff),
-                    float(drift), "FEE_DEDUCTION", exc["exception_msg"], recon_timestamp
-                ))
+                decisions_to_record.append({
+                    "subject_type": "BUSINESS_TX",
+                    "subject_id": tx_id,
+                    "business_tx_id": tx_id,
+                    "order_id": order_id,
+                    "payment_id": pay_id,
+                    "payout_id": payout_id,
+                    "credit_id": None,
+                    "match_status": "RULE_OVERRIDDEN",
+                    "discrepancy_code": "CORPORATE_CARD_SURCHARGE",
+                    "variance_paise": fee_variance_p,
+                    "evidence": evidence
+                })
+                matched_records_export.append({
+                    "business_tx_id": tx_id,
+                    "order_id": order_id,
+                    "payment_id": pay_id,
+                    "payout_id": payout_id,
+                    "amount_paise": oms_amt_p,
+                    "amount_inr": format_paise_inr(oms_amt_p),
+                    "match_status": "RULE_OVERRIDDEN",
+                    "rule_applied": matched_rule["rule_id"]
+                })
+            else:
+                tx_exception_count += 1
+                evidence = {
+                    "business_tx_id": tx_id,
+                    "order_id": order_id,
+                    "payment_id": pay_id,
+                    "payout_id": payout_id,
+                    "amount_paise": oms_amt_p,
+                    "actual_fee_paise": actual_fee_p,
+                    "expected_fee_paise": expected_fee_p,
+                    "fee_variance_paise": fee_variance_p,
+                    "reason": f"Fee discrepancy: gateway deducted ₹{paise_to_rupees(actual_fee_p)} fee (expected ₹{paise_to_rupees(expected_fee_p)} @ 2.0% MDR)."
+                }
+                decisions_to_record.append({
+                    "subject_type": "BUSINESS_TX",
+                    "subject_id": tx_id,
+                    "business_tx_id": tx_id,
+                    "order_id": order_id,
+                    "payment_id": pay_id,
+                    "payout_id": payout_id,
+                    "credit_id": None,
+                    "match_status": "EXCEPTION",
+                    "discrepancy_code": "FEE_TAX_DISCREPANCY",
+                    "variance_paise": fee_variance_p,
+                    "evidence": evidence
+                })
+                exception_records_export.append({
+                    "subject_type": "BUSINESS_TX",
+                    "subject_id": tx_id,
+                    "discrepancy_code": "FEE_TAX_DISCREPANCY",
+                    "variance_paise": fee_variance_p,
+                    "variance_inr": format_paise_inr(fee_variance_p),
+                    "summary": evidence["reason"]
+                })
             continue
 
-        # Transaction perfectly matches contract
-        matched_records.append({
+        # Transaction cleanly matches OMS <-> Settlement
+        tx_matched_count += 1
+        evidence = {
+            "business_tx_id": tx_id,
             "order_id": order_id,
             "payment_id": pay_id,
-            "gross_amount": float(gross_amt),
-            "settled_amount": float(settle_amt),
-            "fee": float(actual_fee),
-            "tax": float(actual_tax),
-            "net_amount": float(actual_net),
-            "sub_paise_drift": float(drift),
-            "status": "MATCHED",
-            "settled_at": settle_row["settled_at"]
+            "payout_id": payout_id,
+            "amount_paise": oms_amt_p,
+            "fee_paise": actual_fee_p,
+            "tax_paise": actual_tax_p,
+            "net_paise": actual_net_p,
+            "reason": "Exact verified 2-way OMS <-> Razorpay match in canonical integer paise."
+        }
+        decisions_to_record.append({
+            "subject_type": "BUSINESS_TX",
+            "subject_id": tx_id,
+            "business_tx_id": tx_id,
+            "order_id": order_id,
+            "payment_id": pay_id,
+            "payout_id": payout_id,
+            "credit_id": None,
+            "match_status": "MATCHED",
+            "discrepancy_code": None,
+            "variance_paise": 0,
+            "evidence": evidence
         })
-        ledger_entries.append((
-            order_id, pay_id, "MATCHED", float(gross_amt), float(settle_amt),
-            float(expected_fee), float(actual_fee), 0.0,
-            float(expected_tax), float(actual_tax), 0.0,
-            float(drift), None, "Verified Sub-Paise Match", recon_timestamp
-        ))
+        matched_records_export.append({
+            "business_tx_id": tx_id,
+            "order_id": order_id,
+            "payment_id": pay_id,
+            "payout_id": payout_id,
+            "amount_paise": oms_amt_p,
+            "amount_inr": format_paise_inr(oms_amt_p),
+            "match_status": "MATCHED",
+            "rule_applied": None
+        })
 
-    # Check for Orphan settlements (in Razorpay but missing in OMS)
-    for _, settle_row in df_settle.iterrows():
-        s_ord_id = settle_row["order_id"]
-        if not s_ord_id or s_ord_id not in oms_by_order:
-            pay_id = settle_row["payment_id"]
-            s_amt = to_decimal(settle_row["amount"])
-            exc = {
-                "order_id": s_ord_id or "UNKNOWN",
-                "payment_id": pay_id,
-                "exception_code": "ORPHAN_SETTLEMENT",
-                "variance": float(s_amt),
-                "exception_msg": f"Payment {pay_id} settled by Razorpay without corresponding internal OMS order.",
-                "status": "AUDIT_REQUIRED"
+    # -------------------------------------------------------------
+    # PASS 2: Settlements <-> Bank Payout Credits (Payout Batch Level)
+    # -------------------------------------------------------------
+    payout_groups = {}
+    for _, s in df_settle.iterrows():
+        p_id = s.get("payout_id")
+        if p_id:
+            payout_groups.setdefault(p_id, []).append(s.to_dict())
+
+    payout_matched_count = 0
+    payout_exception_count = 0
+
+    for payout_id, s_list in payout_groups.items():
+        batch_net_paise = sum(require_paise(int(s["net_paise"])) for s in s_list)
+        settlement_count = len(s_list)
+        bank_credit_row = bank_by_payout.get(payout_id)
+
+        if bank_credit_row is None:
+            # Delayed bank payout credit
+            payout_exception_count += 1
+            evidence = {
+                "payout_id": payout_id,
+                "settlement_count": settlement_count,
+                "batch_net_paise": batch_net_paise,
+                "reason": f"Payout batch {payout_id} ({settlement_count} settlements totaling ₹{paise_to_rupees(batch_net_paise)}) has not yet arrived in bank account credit feed."
             }
-            exception_records.append(exc)
-            ledger_entries.append((
-                s_ord_id, pay_id, "EXCEPTION", 0.0, float(s_amt),
-                0.0, float(to_decimal(settle_row["fee"])), 0.0,
-                0.0, float(to_decimal(settle_row["tax"])), 0.0,
-                0.0, "ORPHAN_SETTLEMENT", exc["exception_msg"], recon_timestamp
-            ))
+            decisions_to_record.append({
+                "subject_type": "PAYOUT",
+                "subject_id": payout_id,
+                "business_tx_id": None,
+                "order_id": None,
+                "payment_id": None,
+                "payout_id": payout_id,
+                "credit_id": None,
+                "match_status": "EXCEPTION",
+                "discrepancy_code": "DELAYED_BANK_CREDIT",
+                "variance_paise": batch_net_paise,
+                "evidence": evidence
+            })
+            exception_records_export.append({
+                "subject_type": "PAYOUT",
+                "subject_id": payout_id,
+                "discrepancy_code": "DELAYED_BANK_CREDIT",
+                "variance_paise": batch_net_paise,
+                "variance_inr": format_paise_inr(batch_net_paise),
+                "summary": evidence["reason"]
+            })
+            continue
 
-    # PASS 4: Daily-to-Monthly GST ITC Safeguard Audit
-    total_daily_tax = sum((to_decimal(r["tax"]) for _, r in df_settle.iterrows()), Decimal("0.00")) if not df_settle.empty else Decimal("0.00")
-    monthly_invoice_tax = to_decimal(df_gst_inv.iloc[0]["total_gst"]) if not df_gst_inv.empty else Decimal("0.00")
-    gst_tax_leakage = float(round_curr(total_daily_tax - monthly_invoice_tax))
+        # Bank credit received
+        credit_id = bank_credit_row["credit_id"]
+        bank_amount_paise = require_paise(int(bank_credit_row["credit_amount_paise"]))
 
-    # Persist outputs with preserved column schema even if records are empty
-    matched_cols = ["order_id", "payment_id", "gross_amount", "settled_amount", "fee", "tax", "net_amount", "sub_paise_drift", "status", "settled_at"]
-    exception_cols = ["order_id", "payment_id", "exception_code", "variance", "exception_msg", "status"]
+        if bank_amount_paise != batch_net_paise:
+            # Bank payout amount mismatch
+            payout_exception_count += 1
+            variance_p = abs(bank_amount_paise - batch_net_paise)
+            evidence = {
+                "payout_id": payout_id,
+                "credit_id": credit_id,
+                "utr_number": bank_credit_row["utr_number"],
+                "settlement_count": settlement_count,
+                "batch_net_paise": batch_net_paise,
+                "bank_amount_paise": bank_amount_paise,
+                "variance_paise": variance_p,
+                "reason": f"Bank credit mismatch on {payout_id}: expected ₹{paise_to_rupees(batch_net_paise)} vs bank credited ₹{paise_to_rupees(bank_amount_paise)}."
+            }
+            decisions_to_record.append({
+                "subject_type": "PAYOUT",
+                "subject_id": payout_id,
+                "business_tx_id": None,
+                "order_id": None,
+                "payment_id": None,
+                "payout_id": payout_id,
+                "credit_id": credit_id,
+                "match_status": "EXCEPTION",
+                "discrepancy_code": "BANK_AMOUNT_MISMATCH",
+                "variance_paise": variance_p,
+                "evidence": evidence
+            })
+            exception_records_export.append({
+                "subject_type": "PAYOUT",
+                "subject_id": payout_id,
+                "discrepancy_code": "BANK_AMOUNT_MISMATCH",
+                "variance_paise": variance_p,
+                "variance_inr": format_paise_inr(variance_p),
+                "summary": evidence["reason"]
+            })
+            continue
 
-    df_matched = pd.DataFrame(matched_records) if matched_records else pd.DataFrame(columns=matched_cols)
-    df_exceptions = pd.DataFrame(exception_records) if exception_records else pd.DataFrame(columns=exception_cols)
+        # Exact Payout Match
+        payout_matched_count += 1
+        evidence = {
+            "payout_id": payout_id,
+            "credit_id": credit_id,
+            "utr_number": bank_credit_row["utr_number"],
+            "settlement_count": settlement_count,
+            "batch_net_paise": batch_net_paise,
+            "bank_amount_paise": bank_amount_paise,
+            "reason": f"Exact 3-way verified bank payout match across {settlement_count} settlements."
+        }
+        decisions_to_record.append({
+            "subject_type": "PAYOUT",
+            "subject_id": payout_id,
+            "business_tx_id": None,
+            "order_id": None,
+            "payment_id": None,
+            "payout_id": payout_id,
+            "credit_id": credit_id,
+            "match_status": "MATCHED",
+            "discrepancy_code": None,
+            "variance_paise": 0,
+            "evidence": evidence
+        })
+        matched_records_export.append({
+            "business_tx_id": None,
+            "order_id": None,
+            "payment_id": None,
+            "payout_id": payout_id,
+            "amount_paise": batch_net_paise,
+            "amount_inr": format_paise_inr(batch_net_paise),
+            "match_status": "MATCHED",
+            "rule_applied": None
+        })
+
+    # Unmatched Bank Credits (Direct credits received without known payout ID)
+    for _, b in df_bank.iterrows():
+        b_payout = b.get("payout_id")
+        if not b_payout or b_payout not in payout_groups:
+            payout_exception_count += 1
+            cr_id = b["credit_id"]
+            cr_amt_p = require_paise(int(b["credit_amount_paise"]))
+            evidence = {
+                "credit_id": cr_id,
+                "utr_number": b["utr_number"],
+                "credit_amount_paise": cr_amt_p,
+                "credited_at": b["credited_at"],
+                "account_tail": b.get("account_tail"),
+                "reason": f"Direct bank credit of ₹{paise_to_rupees(cr_amt_p)} with UTR {b['utr_number']} received with no corresponding gateway payout batch."
+            }
+            decisions_to_record.append({
+                "subject_type": "BANK_CREDIT",
+                "subject_id": cr_id,
+                "business_tx_id": None,
+                "order_id": None,
+                "payment_id": None,
+                "payout_id": None,
+                "credit_id": cr_id,
+                "match_status": "EXCEPTION",
+                "discrepancy_code": "UNIDENTIFIED_DIRECT_CREDIT",
+                "variance_paise": cr_amt_p,
+                "evidence": evidence
+            })
+            exception_records_export.append({
+                "subject_type": "BANK_CREDIT",
+                "subject_id": cr_id,
+                "discrepancy_code": "UNIDENTIFIED_DIRECT_CREDIT",
+                "variance_paise": cr_amt_p,
+                "variance_inr": format_paise_inr(cr_amt_p),
+                "summary": evidence["reason"]
+            })
+
+    # -------------------------------------------------------------
+    # PASS 4: Append-Only Idempotent Persistence
+    # -------------------------------------------------------------
+    total_business_tx = len(all_tx_ids)
+    total_payout_batches = len(payout_groups) + len([b for _, b in df_bank.iterrows() if not b.get("payout_id") or b.get("payout_id") not in payout_groups])
+    total_source_records = len(df_oms) + len(df_settle) + len(df_bank)
+    total_matched = tx_matched_count + payout_matched_count
+    total_exceptions = tx_exception_count + payout_exception_count
+
+    tx_match_rate = round((tx_matched_count / total_business_tx) * 100, 2) if total_business_tx > 0 else 0.0
+    payout_match_rate = round((payout_matched_count / total_payout_batches) * 100, 2) if total_payout_batches > 0 else 0.0
+
+    metrics_payload = {
+        "transaction_metrics": {
+            "total_business_transactions": total_business_tx,
+            "matched_count": tx_matched_count,
+            "exception_count": tx_exception_count,
+            "match_rate_percent": tx_match_rate,
+            "unresolved_rate_percent": round((tx_exception_count / total_business_tx) * 100, 2) if total_business_tx > 0 else 0.0
+        },
+        "payout_metrics": {
+            "total_payout_batches": total_payout_batches,
+            "matched_count": payout_matched_count,
+            "exception_count": payout_exception_count,
+            "match_rate_percent": payout_match_rate
+        },
+        "total_source_records": total_source_records,
+        "input_snapshot_hash": input_snapshot_hash,
+        "matcher_version": MATCHER_VERSION
+    }
+
+    with get_db_cursor(target_db) as cursor:
+        # 1. Insert append-only reconciliation run
+        cursor.execute("""
+            INSERT INTO reconciliation_runs (
+                run_timestamp, matcher_version, input_snapshot_hash, git_sha,
+                total_business_tx, total_source_records, matched_count,
+                exception_count, metrics_json, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED');
+        """, (
+            run_timestamp,
+            MATCHER_VERSION,
+            input_snapshot_hash,
+            git_sha,
+            total_business_tx,
+            total_source_records,
+            total_matched,
+            total_exceptions,
+            json.dumps(metrics_payload)
+        ))
+        run_id = cursor.lastrowid
+
+        # 2. Persist decisions with idempotency check
+        links_to_insert = []
+        for dec in decisions_to_record:
+            # Deterministic decision fingerprint: hash of snapshot + matcher version + subject
+            fp_raw = f"{input_snapshot_hash}:{MATCHER_VERSION}:{dec['subject_type']}:{dec['subject_id']}"
+            fingerprint = f"sha256:{hashlib.sha256(fp_raw.encode('utf-8')).hexdigest()}"
+
+            # Check if decision already exists for this exact input snapshot and matcher version
+            cursor.execute("SELECT decision_id FROM reconciliation_decisions WHERE decision_fingerprint = ?", (fingerprint,))
+            existing = cursor.fetchone()
+
+            if existing:
+                decision_id = existing[0]
+            else:
+                cursor.execute("""
+                    INSERT INTO reconciliation_decisions (
+                        decision_fingerprint, input_snapshot_hash, matcher_version,
+                        subject_type, subject_id, business_tx_id, order_id, payment_id,
+                        payout_id, credit_id, match_status, discrepancy_code,
+                        variance_paise, evidence_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    fingerprint,
+                    input_snapshot_hash,
+                    MATCHER_VERSION,
+                    dec["subject_type"],
+                    dec["subject_id"],
+                    dec["business_tx_id"],
+                    dec["order_id"],
+                    dec["payment_id"],
+                    dec["payout_id"],
+                    dec["credit_id"],
+                    dec["match_status"],
+                    dec["discrepancy_code"],
+                    dec["variance_paise"],
+                    json.dumps(dec["evidence"], sort_keys=True),
+                    run_timestamp
+                ))
+                decision_id = cursor.lastrowid
+
+            links_to_insert.append((run_id, decision_id))
+
+        # 3. Link run to decisions (idempotent link)
+        cursor.executemany("""
+            INSERT OR IGNORE INTO run_decision_links (run_id, decision_id) VALUES (?, ?);
+        """, links_to_insert)
+
+    # Log immutable audit event
+    log_audit_event(
+        target_db,
+        event_type="RECONCILIATION_SWEEP_COMPLETED",
+        aggregate_type="RECON_RUN",
+        aggregate_id=str(run_id),
+        payload={
+            "run_id": run_id,
+            "input_snapshot_hash": input_snapshot_hash,
+            "matcher_version": MATCHER_VERSION,
+            "total_business_tx": total_business_tx,
+            "tx_match_rate": tx_match_rate,
+            "payout_match_rate": payout_match_rate,
+            "total_decisions_linked": len(links_to_insert)
+        }
+    )
+
+    # Export CSV and JSON reports
+    df_matched = pd.DataFrame(matched_records_export) if matched_records_export else pd.DataFrame(columns=["business_tx_id", "match_status"])
+    df_exceptions = pd.DataFrame(exception_records_export) if exception_records_export else pd.DataFrame(columns=["subject_type", "subject_id", "discrepancy_code"])
 
     matched_path = OUT_DIR / "final-matched-ledger.csv"
     exception_path = OUT_DIR / "final-exception-queue.csv"
+    summary_path = OUT_DIR / "recon-run-summary.json"
 
     df_matched.to_csv(matched_path, index=False)
     df_exceptions.to_csv(exception_path, index=False)
 
-    total_audited = len(df_settle)
-    matched_count = len(matched_records)
-    match_rate = (matched_count / total_audited) * 100 if total_audited > 0 else 0.0
-
-    # Update reconciliation_ledger and record audit trail in SQLite
-    with get_db_cursor(db_path) as cursor:
-        cursor.execute("DELETE FROM reconciliation_ledger;")
-        cursor.executemany("""
-            INSERT INTO reconciliation_ledger (
-                order_id, payment_id, reconciled_status, order_amount, settlement_amount,
-                expected_fee, actual_fee, fee_variance, expected_tax, actual_tax, tax_variance,
-                sub_paise_drift, exception_code, exception_msg, reconciled_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, ledger_entries)
-        cursor.execute("""
-            INSERT INTO reconciliation_runs (
-                run_timestamp, git_sha, seed_hash, total_audited, matched_count, exception_count,
-                match_rate, sub_paise_accumulator, gst_daily_aggregate,
-                gst_monthly_invoice, gst_tax_leakage, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED');
-        """, (
-            recon_timestamp, git_sha, seed_hash, total_audited, matched_count, len(exception_records),
-            round(match_rate, 2), float(rolling_sub_paise_drift), float(round_curr(total_daily_tax)),
-            float(round_curr(monthly_invoice_tax)), gst_tax_leakage
-        ))
-        run_id = cursor.lastrowid
-
-    # Generate and export Monthly GST ITC Discrepancy Audit Report
-    tax_report_path = OUT_DIR / "monthly-tax-audit-report.json"
-    root_tax_report_path = BASE_DIR / "monthly-tax-audit-report.json"
-    tax_report = {
-        "report_title": "PaisaGuard Monthly GST ITC Discrepancy & Tax Audit Report",
-        "audit_month": "August 2026",
-        "compliance_framework": "Section 16(2)(aa) of CGST Act / GSTR-2B Matching",
-        "audited_at": recon_timestamp,
-        "run_id": run_id,
-        "git_sha": git_sha,
-        "seed_hash": seed_hash,
-        "daily_settlement_aggregate_gst": float(round_curr(total_daily_tax)),
-        "gstr2b_monthly_invoice_gst": float(round_curr(monthly_invoice_tax)),
-        "detected_tax_leakage": gst_tax_leakage,
-        "status": "DISCREPANCY_DETECTED" if gst_tax_leakage != 0 else "BALANCED",
-        "recommended_action": f"Dispute notice auto-generated for ₹{gst_tax_leakage:.2f} excess deduction on supplier GSTR-1 discrepancy" if gst_tax_leakage > 0 else "No tax leakage detected. GSTR-2B reconciles.",
-        "details": {
-            "total_settlements_audited": len(df_settle),
-            "discrepancy_direction": "GATEWAY_OVER_DEDUCTION" if gst_tax_leakage > 0 else "NONE",
-            "risk_exposure": "Loss of eligible Input Tax Credit under GSTR-2B reconciliation"
-        }
-    }
-    with open(tax_report_path, "w") as f:
-        json.dump(tax_report, f, indent=2)
-    with open(root_tax_report_path, "w") as f:
-        json.dump(tax_report, f, indent=2)
-
     summary = {
         "run_id": run_id,
+        "run_timestamp": run_timestamp,
+        "input_snapshot_hash": input_snapshot_hash,
+        "matcher_version": MATCHER_VERSION,
         "git_sha": git_sha,
-        "seed_hash": seed_hash,
-        "total_audited": total_audited,
-        "matched_count": matched_count,
-        "exception_count": len(exception_records),
-        "match_rate": round(match_rate, 2),
-        "sub_paise_accumulator": float(rolling_sub_paise_drift),
-        "gst_daily_aggregate": float(round_curr(total_daily_tax)),
-        "gst_monthly_invoice": float(round_curr(monthly_invoice_tax)),
-        "gst_tax_leakage": gst_tax_leakage,
+        "transaction_metrics": metrics_payload["transaction_metrics"],
+        "payout_metrics": metrics_payload["payout_metrics"],
+        "total_source_records": total_source_records,
         "matched_csv": str(matched_path),
         "exception_csv": str(exception_path)
     }
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
 
     return summary
 
 
 if __name__ == "__main__":
     res = execute_reconciliation_pipeline()
-    print("Reconciliation Pipeline Execution Complete:")
-    for k, v in res.items():
-        print(f"  {k}: {v}")
+    print("=" * 65)
+    print("  PAISAGUARD DETERMINISTIC 3-SOURCE RECONCILIATION PIPELINE")
+    print("=" * 65)
+    print(f"  Run ID                  : {res['run_id']}")
+    print(f"  Input Snapshot Hash     : {res['input_snapshot_hash'][:24]}...")
+    print(f"  Matcher Version         : {res['matcher_version']}")
+    print(f"  Business Transactions   : {res['transaction_metrics']['total_business_transactions']}")
+    print(f"  Transaction Match Rate  : {res['transaction_metrics']['match_rate_percent']}%")
+    print(f"  Transaction Exceptions  : {res['transaction_metrics']['exception_count']}")
+    print(f"  Payout Batches Audited  : {res['payout_metrics']['total_payout_batches']}")
+    print(f"  Payout Match Rate       : {res['payout_metrics']['match_rate_percent']}%")
+    print(f"  Total Source Records    : {res['total_source_records']}")
+    print("=" * 65)
