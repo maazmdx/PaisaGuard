@@ -1,45 +1,55 @@
+"""
+app.py — PaisaGuard Streamlit Evaluator Console.
+
+Consolidated FinOps Evaluator Dashboard across 5 Core Surfaces:
+1. Batch KPI Board (Overall match rates, coverage, discrepancy breakdown)
+2. Payout Table (Razorpay payout batches vs Bank credits, settlement counts, UTRs)
+3. Exception Evidence + AI Response Drawer (Detailed investigation, cited records, policy gate, human actions)
+4. Human Approval Timeline (Strictly append-only audit trail and reviewer actions)
+5. Benchmark & Accuracy Report (Measured throughput, p50/p95 latency, precision/recall, AI accuracy)
+
+Architectural Guarantees:
+- ZERO direct SQLite database access. All data is read and written exclusively via FastAPI HTTP endpoints.
+- Server-side token handling: reads PAISAGUARD_API_TOKEN from environment.
+- If PAISAGUARD_API_TOKEN is unset, displays a prominent notice and disables write actions.
+- Reviewers provide operator identity only (e.g. name / email), never raw secrets.
+"""
+
 import os
 import sys
+import json
 import time
-import sqlite3
+from typing import Dict, Any, Optional, List
+import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from decimal import Decimal
-from pathlib import Path
 
-# Base directory setup
-BASE_DIR = Path(__file__).resolve().parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.append(str(BASE_DIR))
+# Environment & API Gateway Configuration
+API_URL = os.environ.get("API_URL", "http://localhost:8001").rstrip("/")
+API_TOKEN = os.environ.get("PAISAGUARD_API_TOKEN", "").strip()
 
-from db import get_db_connection, DEFAULT_DB_PATH
-from recon_engine import execute_reconciliation_pipeline
-from seed_data import generate_financial_dataset
-from concurrency_tester import simulate_webhook_flood
-
-# Configure Streamlit Page
+# Page configuration
 st.set_page_config(
-    page_title="PaisaGuard | Razorpay Financial Controller",
-    page_icon="💳",
+    page_title="PaisaGuard | Razorpay AI Finance Controller",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Razorpay Official Design System & High-End Dark Fintech Theme
+# High-End Dark Fintech Theme Styling
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-    
+
     html, body, [class*="css"] {
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
-    
-    /* Main Background */
+
     .stApp {
         background-color: #070d18;
-        background-image: 
+        background-image:
             radial-gradient(at 0% 0%, rgba(2, 132, 199, 0.12) 0px, transparent 50%),
             radial-gradient(at 100% 0%, rgba(37, 99, 235, 0.08) 0px, transparent 50%);
         color: #f1f5f9;
@@ -98,455 +108,533 @@ st.markdown("""
         font-size: 0.78rem;
         font-weight: 600;
     }
-    .rzp-status-dot {
-        width: 8px;
-        height: 8px;
-        background-color: #10b981;
-        border-radius: 50%;
-        box-shadow: 0 0 8px #10b981;
+    .rzp-status-pill-warn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: rgba(245, 158, 11, 0.12);
+        color: #fbbf24;
+        border: 1px solid rgba(245, 158, 11, 0.3);
+        padding: 4px 12px;
+        border-radius: 9999px;
+        font-size: 0.78rem;
+        font-weight: 600;
     }
 
-    /* Executive KPI Cards */
-    div[data-testid="metric-container"] {
-        background: rgba(15, 27, 46, 0.75);
-        backdrop-filter: blur(12px);
-        border: 1px solid #1e3a5f;
-        padding: 20px;
+    /* Metric Cards */
+    .kpi-card {
+        background: rgba(15, 23, 42, 0.75);
+        border: 1px solid #1e293b;
         border-radius: 12px;
-        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        padding: 20px;
+        margin-bottom: 12px;
+        transition: transform 0.2s, border-color 0.2s;
     }
-    div[data-testid="metric-container"]:hover {
-        border-color: #38bdf8;
+    .kpi-card:hover {
+        border-color: #0284c7;
         transform: translateY(-2px);
-        box-shadow: 0 12px 28px rgba(2, 132, 199, 0.15);
     }
-    div[data-testid="stMetricValue"] {
-        font-size: 2rem !important;
-        font-weight: 700 !important;
-        color: #f8fafc !important;
+    .kpi-title {
+        font-size: 0.80rem;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        font-weight: 600;
+        margin-bottom: 8px;
+    }
+    .kpi-value {
+        font-size: 1.85rem;
+        font-weight: 800;
+        color: #ffffff;
         letter-spacing: -0.02em;
     }
-    div[data-testid="stMetricLabel"] {
-        font-size: 0.82rem !important;
-        font-weight: 600 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: #94a3b8 !important;
+    .kpi-sub {
+        font-size: 0.75rem;
+        color: #64748b;
+        margin-top: 4px;
     }
 
-    /* Razorpay Blue Primary Buttons */
-    .stButton>button {
-        background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
-        color: #ffffff !important;
-        font-weight: 600 !important;
-        border: 1px solid #38bdf8 !important;
-        border-radius: 8px !important;
-        padding: 8px 16px !important;
-        transition: all 0.2s ease-in-out !important;
-        box-shadow: 0 4px 12px rgba(2, 132, 199, 0.25) !important;
-    }
-    .stButton>button:hover {
-        background: linear-gradient(135deg, #0369a1 0%, #1d4ed8 100%) !important;
-        border-color: #7dd3fc !important;
-        box-shadow: 0 6px 18px rgba(2, 132, 199, 0.4) !important;
-        transform: translateY(-1px);
-    }
-
-    /* Tabs Styling */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-        background-color: rgba(12, 26, 48, 0.6);
-        padding: 6px;
-        border-radius: 10px;
-        border: 1px solid #1e3a5f;
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 6px;
-        color: #94a3b8;
-        font-weight: 500;
-        padding: 8px 18px;
-        border: none;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #0284c7 !important;
-        color: #ffffff !important;
-        font-weight: 600;
-    }
-
-    /* Status Badges */
-    .badge-matched {
-        background: rgba(16, 185, 129, 0.15);
-        color: #34d399;
-        border: 1px solid rgba(16, 185, 129, 0.3);
-        padding: 3px 8px;
-        border-radius: 9999px;
-        font-size: 0.75rem;
-        font-weight: 600;
-    }
-    .badge-exception {
-        background: rgba(239, 68, 68, 0.15);
-        color: #f87171;
-        border: 1px solid rgba(239, 68, 68, 0.3);
-        padding: 3px 8px;
-        border-radius: 9999px;
-        font-size: 0.75rem;
-        font-weight: 600;
-    }
-    .badge-override {
-        background: rgba(59, 130, 246, 0.15);
-        color: #60a5fa;
-        border: 1px solid rgba(59, 130, 246, 0.3);
-        padding: 3px 8px;
-        border-radius: 9999px;
-        font-size: 0.75rem;
-        font-weight: 600;
+    /* Code & JSON display */
+    pre, code {
+        font-family: 'JetBrains Mono', monospace !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Ensure database exists and is seeded
-if not DEFAULT_DB_PATH.exists():
-    with st.spinner("Provisioning PaisaGuard database with high-fidelity settlements..."):
-        generate_financial_dataset(DEFAULT_DB_PATH)
-        execute_reconciliation_pipeline(DEFAULT_DB_PATH)
 
-# Razorpay Header Bar
-st.markdown("""
+# HTTP Helper functions (Zero direct DB connection)
+def api_get(path: str) -> Optional[Dict[str, Any]]:
+    """Makes a GET request to the isolated FastAPI service."""
+    try:
+        url = f"{API_URL}{path}"
+        headers = {}
+        if API_TOKEN:
+            headers["X-PaisaGuard-Token"] = API_TOKEN
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 401:
+            st.error(f"Unauthorized (401) on {path}: Invalid or missing PAISAGUARD_API_TOKEN.")
+        else:
+            st.error(f"API Error ({resp.status_code}) on {path}: {resp.text}")
+        return None
+    except requests.exceptions.ConnectionError:
+        st.error(f"🔌 Connection failed: Cannot reach PaisaGuard API at `{API_URL}`. Verify the FastAPI service is running.")
+        return None
+    except Exception as exc:
+        st.error(f"Unexpected error communicating with API: {exc}")
+        return None
+
+
+def api_post(path: str, payload: Dict[str, Any]) -> Tuple[bool, Any]:
+    """Makes a POST request to the isolated FastAPI service."""
+    try:
+        url = f"{API_URL}{path}"
+        headers = {"Content-Type": "application/json"}
+        if API_TOKEN:
+            headers["X-PaisaGuard-Token"] = API_TOKEN
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code in (200, 201):
+            return True, resp.json()
+        elif resp.status_code == 503:
+            return False, "Server state mutations are disabled (PAISAGUARD_API_TOKEN is unset on the API server)."
+        elif resp.status_code == 401:
+            return False, "Unauthorized (401): Valid X-PaisaGuard-Token is required for this action."
+        else:
+            try:
+                err_detail = resp.json().get("detail", resp.text)
+            except Exception:
+                err_detail = resp.text
+            return False, f"HTTP {resp.status_code}: {err_detail}"
+    except requests.exceptions.ConnectionError:
+        return False, f"Cannot connect to API at {API_URL}."
+    except Exception as exc:
+        return False, str(exc)
+
+
+# Top Navigation Header
+token_configured = bool(API_TOKEN)
+status_pill = (
+    '<span class="rzp-status-pill">● SECURE GATEWAY CONNECTED</span>'
+    if token_configured
+    else '<span class="rzp-status-pill-warn">● READ-ONLY (TOKEN UNCONFIGURED)</span>'
+)
+
+st.markdown(f"""
 <div class="rzp-navbar">
     <div class="rzp-brand">
-        <div class="rzp-logo-badge">Razorpay / PaisaGuard</div>
+        <div class="rzp-logo-badge">PG</div>
         <div>
-            <h1 class="rzp-title">AI-Native Financial Controller</h1>
-            <p class="rzp-tagline">Deterministic Sub-Paise Reconciliation, GST ITC Safeguard & Lock-Free Concurrency Engine</p>
+            <h1 class="rzp-title">PaisaGuard AI Financial Controller</h1>
+            <p class="rzp-tagline">Track 04: AI Finance Controller | 3-Source Reconciliation & Autonomous Exception Triage</p>
         </div>
     </div>
     <div>
-        <div class="rzp-status-pill">
-            <div class="rzp-status-dot"></div>
-            <span>SQLite WAL Engine: ACTIVE (Zero Lock Contention)</span>
-        </div>
+        {status_pill}
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-# Sidebar Controls & Diagnostics
+# Security Alert Notice if Token is Unset
+if not token_configured:
+    st.warning(
+        "⚠️ **Write actions disabled: PAISAGUARD_API_TOKEN is not configured on server.**\n\n"
+        "The dashboard is operating in read-only mode. To trigger reconciliation sweeps, run AI investigations, "
+        "or record human approvals, configure `PAISAGUARD_API_TOKEN` in your environment or `.env` file."
+    )
+
+# Sidebar Controls
 with st.sidebar:
-    st.markdown("### 💳 **Merchant Controls**")
-    st.caption("Account ID: `mid_rzp_live_2026_enterprise`")
-    
-    if st.button("🔄 Run 4-Pass Reconciliation Sweep", type="primary", use_container_width=True):
-        with st.spinner("Executing Mathematical Settlement Reconciliation..."):
-            summary = execute_reconciliation_pipeline(DEFAULT_DB_PATH)
-            st.toast(f"Sweep Completed! Reconciled {summary['matched_count']}/{summary['total_audited']} settlements.", icon="✅")
-            time.sleep(0.4)
-            st.rerun()
+    st.image("https://img.shields.io/badge/PaisaGuard-v3.0.0-blue?style=for-the-badge&logo=shield", use_container_width=True)
+    st.markdown("### FinOps Operator Controls")
 
-    if st.button("🌱 Reset & Re-Seed Test Ledger", use_container_width=True):
-        with st.spinner("Restoring baseline settlement feeds..."):
-            generate_financial_dataset(DEFAULT_DB_PATH)
-            execute_reconciliation_pipeline(DEFAULT_DB_PATH)
-            st.toast("Database restored to default test state.", icon="🔄")
-    if st.button("⚡ Live Replay Webhooks (HMAC Verified)", use_container_width=True):
-        with st.spinner("Injecting simulated webhooks into gateway..."):
-            try:
-                from replay_webhooks import SAMPLE_EVENTS, replay_event
-                replayed = 0
-                for ev in SAMPLE_EVENTS:
-                    status_c, _ = replay_event(ev, "http://127.0.0.1:8001/webhooks/razorpay")
-                    if status_c in (200, 401):
-                        replayed += 1
-                execute_reconciliation_pipeline(DEFAULT_DB_PATH)
-                st.toast(f"Replayed {len(SAMPLE_EVENTS)} signed webhooks into live engine!", icon="⚡")
+    reviewer_id = st.text_input("Operator / Reviewer Identity", value="auditor_ops", help="Your operator identifier recorded in the append-only audit trail.")
+
+    st.markdown("---")
+    st.markdown("### Deterministic Sweep")
+    st.caption("Re-evaluates OMS orders, Razorpay settlements, and Bank payout credits.")
+
+    if st.button("🔄 Trigger Full Reconcile Sweep", disabled=not token_configured, use_container_width=True):
+        with st.spinner("Executing 3-source reconciliation pipeline..."):
+            success, res = api_post("/reconcile/sweep", {})
+            if success:
+                st.success(f"Reconciliation run #{res.get('run_id')} completed successfully!")
+                time.sleep(1)
                 st.rerun()
-            except Exception as ex:
-                st.warning(f"Replayer note: Ensure FastAPI gateway is running on port 8001 (`uvicorn api:app --port 8001`). Details: {ex}")
+            else:
+                st.error(f"Sweep failed: {res}")
 
-    st.divider()
-    st.markdown("### ⚙️ **Engine Architecture**")
-    st.markdown("• **Mode**: `SQLite 3.42+ WAL`")
-    st.markdown("• **Sync Pragma**: `NORMAL`")
-    st.markdown("• **Lock Timeout**: `5000ms`")
-    st.markdown("• **Sub-Paise Strategy**: `Rolling Accumulator`")
-    st.markdown("• **Tax Compliance**: `CGST Sec 16(2)(aa) GSTR-2B`")
+    st.markdown("---")
+    st.markdown("### System Architecture")
+    st.markdown("""
+    - **Source 1**: Internal OMS Orders
+    - **Source 2**: Razorpay Settlements & Fees
+    - **Source 3**: Bank Payout Credit Feed
+    - **Ledger**: Integer Paise (`*_paise`)
+    - **Agent**: Read-Only with Citation Validation
+    - **Approvals**: Strictly Append-Only
+    """)
 
-    st.divider()
-    st.markdown("### 📥 **Export Audit Ledgers**")
-    matched_csv = BASE_DIR / "out" / "final-matched-ledger.csv"
-    exception_csv = BASE_DIR / "out" / "final-exception-queue.csv"
-    if matched_csv.exists():
-        with open(matched_csv, "rb") as f:
-            st.download_button("📥 Download Matched Ledger (CSV)", f, file_name="paisa_guard_matched_ledger.csv", mime="text/csv", use_container_width=True)
-    if exception_csv.exists():
-        with open(exception_csv, "rb") as f:
-            st.download_button("📥 Download Exception Queue (CSV)", f, file_name="paisa_guard_exception_queue.csv", mime="text/csv", use_container_width=True)
-
-# Data Extraction
-def load_data():
-    conn = get_db_connection(DEFAULT_DB_PATH)
-    try:
-        df_oms = pd.read_sql("SELECT * FROM oms_orders", conn)
-        df_settle = pd.read_sql("SELECT * FROM razorpay_settlements", conn)
-        df_rules = pd.read_sql("SELECT * FROM resolved_rules", conn)
-        df_ledger = pd.read_sql("SELECT * FROM reconciliation_ledger", conn)
-        df_gst = pd.read_sql("SELECT * FROM gst_monthly_invoices", conn)
-        return df_oms, df_settle, df_rules, df_ledger, df_gst
-    finally:
-        conn.close()
-
-try:
-    df_oms, df_settle, df_rules, df_ledger, df_gst = load_data()
-    total_audited = len(df_settle)
-    matched_count = len(df_ledger[df_ledger["reconciled_status"].isin(["MATCHED", "RULE_OVERRIDDEN"])])
-    exception_count = len(df_ledger[df_ledger["reconciled_status"] == "EXCEPTION"])
-    match_rate = (matched_count / total_audited * 100) if total_audited > 0 else 0.0
-    sub_paise_total = df_ledger["sub_paise_drift"].sum()
-    daily_gst_total = df_settle["tax"].sum()
-    monthly_inv_gst = df_gst["total_gst"].iloc[0] if not df_gst.empty else 0.0
-    gst_leakage = round(daily_gst_total - monthly_inv_gst, 2)
-except Exception as e:
-    st.error(f"Error connecting to database: {e}")
+# Fetch core metrics
+metrics_data = api_get("/metrics")
+if not metrics_data:
+    st.info("Awaiting connection to PaisaGuard API gateway. Refresh or check container logs.")
     st.stop()
 
-# Top 4 Executive KPI Cards
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-with kpi1:
-    st.metric(
-        label="Settlement Match Rate",
-        value=f"{match_rate:.2f}%",
-        delta=f"{matched_count}/{total_audited} Reconciled (Target >95%)",
-        delta_color="normal"
-    )
-with kpi2:
-    total_vol = df_settle["amount"].sum()
-    st.metric(
-        label="Total Audited Volume",
-        value=f"₹{total_vol:,.2f}",
-        delta=f"{len(df_oms)} OMS Orders Audited",
-        delta_color="off"
-    )
-with kpi3:
-    st.metric(
-        label="Sub-Paise Rounding Drift",
-        value=f"{sub_paise_total:+.4f} INR",
-        delta="Safe Accumulator Active (Bounded)",
-        delta_color="normal"
-    )
-with kpi4:
-    st.metric(
-        label="GST ITC Tax Leakage",
-        value=f"₹{gst_leakage:.2f} INR",
-        delta="🚨 Over-deduction: Dispute Filed" if gst_leakage != 0 else "✅ GSTR-2B Aligned",
-        delta_color="inverse" if gst_leakage != 0 else "normal"
-    )
-
-st.write("")
-
-# 4 Operational Tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Reconciled Settlements (Matched)",
-    "⚠️ Exception Queue & Dynamic Rules",
-    "⚖️ GST ITC Audit & Section 16 Protection",
-    "⚡ Adversarial Concurrency Stress-Tester"
+# Tab Navigation: 5 Consolidated Surfaces
+tab_kpi, tab_payouts, tab_exceptions, tab_approvals, tab_benchmarks = st.tabs([
+    "📊 Batch KPI Board",
+    "🏦 Payout Batches",
+    "🔍 Exceptions & AI Investigator",
+    "📜 Audit & Human Approval Log",
+    "🎯 Benchmark & Accuracy Console"
 ])
 
-# ----------------- TAB 1: MATCHED LEDGER -----------------
-with tab1:
-    st.subheader("📊 Verified & Mathematically Matched Settlements")
-    st.markdown("All transactions reconciled against merchant pricing contracts (**2.0% MDR + 18% GST**) with rolling sub-paise accumulator accuracy.")
+# -------------------------------------------------------------
+# SURFACE 1: BATCH KPI BOARD
+# -------------------------------------------------------------
+with tab_kpi:
+    st.markdown("### Operational Reconciliation Health")
+    tx_m = metrics_data.get("transaction_metrics", {})
+    po_m = metrics_data.get("payout_metrics", {})
+    counts = metrics_data.get("counts", {})
 
-    col_s1, col_s2, col_s3 = st.columns([2, 1, 1])
-    with col_s1:
-        search = st.text_input("🔍 Quick Search by Order ID or Payment ID", "")
-    with col_s2:
-        status_sel = st.selectbox("Status Filter", ["All", "MATCHED", "RULE_OVERRIDDEN"])
-    with col_s3:
-        st.write("")
-        st.markdown(f"**Verified Records:** `{matched_count}` transactions")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">Txn Match Rate</div>
+            <div class="kpi-value">{tx_m.get('match_rate_percent', 0.0)}%</div>
+            <div class="kpi-sub">{tx_m.get('matched_count', 0)} of {tx_m.get('total_business_transactions', 0)} Transactions</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">Payout Match Rate</div>
+            <div class="kpi-value">{po_m.get('match_rate_percent', 0.0)}%</div>
+            <div class="kpi-sub">{po_m.get('matched_count', 0)} of {po_m.get('total_payout_batches', 0)} Payout Batches</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">Open Exceptions</div>
+            <div class="kpi-value" style="color: #f87171;">{tx_m.get('exception_count', 0) + po_m.get('exception_count', 0)}</div>
+            <div class="kpi-sub">{tx_m.get('exception_count', 0)} Txn / {po_m.get('exception_count', 0)} Payout</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">Total Source Records</div>
+            <div class="kpi-value">{counts.get('oms_orders', 0) + counts.get('razorpay_settlements', 0) + counts.get('bank_payout_credits', 0)}</div>
+            <div class="kpi-sub">{counts.get('oms_orders', 0)} OMS / {counts.get('razorpay_settlements', 0)} RZP / {counts.get('bank_payout_credits', 0)} Bank</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    matched_file = BASE_DIR / "out" / "final-matched-ledger.csv"
-    if matched_file.exists():
-        df_m = pd.read_csv(matched_file)
-        if status_sel != "All":
-            df_m = df_m[df_m["status"] == status_sel]
-        if search:
-            q = search.lower()
-            df_m = df_m[df_m["order_id"].str.lower().str.contains(q, na=False) | df_m["payment_id"].str.lower().str.contains(q, na=False)]
-        
-        st.dataframe(
-            df_m,
-            column_config={
-                "order_id": st.column_config.TextColumn("Order ID"),
-                "payment_id": st.column_config.TextColumn("Payment ID"),
-                "gross_amount": st.column_config.NumberColumn("Gross Volume", format="₹%.2f"),
-                "settled_amount": st.column_config.NumberColumn("Settled Volume", format="₹%.2f"),
-                "fee": st.column_config.NumberColumn("Gateway Fee (MDR)", format="₹%.2f"),
-                "tax": st.column_config.NumberColumn("GST Tax (18%)", format="₹%.2f"),
-                "net_amount": st.column_config.NumberColumn("Net Merchant Payout", format="₹%.2f"),
-                "sub_paise_drift": st.column_config.NumberColumn("Drift", format="%.4f"),
-                "status": st.column_config.TextColumn("Status"),
-                "settled_at": st.column_config.TextColumn("Settlement Timestamp")
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("Run a reconciliation sweep to populate the matched ledger.")
+    # Discrepancy Breakdown Visuals
+    st.markdown("---")
+    st.markdown("#### Exception & Discrepancy Distribution")
+    exc_data = api_get("/exceptions") or {}
+    exceptions_list = exc_data.get("exceptions", [])
 
-# ----------------- TAB 2: EXCEPTION QUEUE -----------------
-with tab2:
-    st.subheader("⚠️ Audit Exception Queue & 1-Click Rule Resolution")
-    st.markdown("""
-    Transactions flagged for contract fee divergence (e.g. corporate card surcharges), 
-    pending settlement batching, or amount mismatches. Operators can apply dynamic rules in real-time.
-    """)
+    if exceptions_list:
+        df_exc = pd.DataFrame(exceptions_list)
+        col_c1, col_c2 = st.columns([1, 1])
 
-    exc_file = BASE_DIR / "out" / "final-exception-queue.csv"
-    if exc_file.exists():
-        df_exc = pd.read_csv(exc_file)
-        if df_exc.empty:
-            st.success("🎉 Zero exceptions! All transactions are 100% reconciled and compliant.")
-        else:
-            for idx, row in df_exc.iterrows():
-                ord_id = row["order_id"]
-                pay_id = row["payment_id"]
-                code = row["exception_code"]
-                variance = row["variance"]
-                msg = row["exception_msg"]
-
-                with st.expander(f"⚠️ [{code}] Order `{ord_id}` | Discrepancy: ₹{variance:.2f}"):
-                    c1, c2 = st.columns([3, 1.2])
-                    with c1:
-                        st.write(f"**Razorpay Payment ID:** `{pay_id}`")
-                        st.write(f"**Audit Finding:** {msg}")
-                        st.write(f"**Financial Impact:** ₹{variance:.2f} INR")
-                    with c2:
-                        if code == "FEE_DEDUCTION":
-                            st.caption("Pricing Contract Discrepancy")
-                            if st.button("⚡ Apply Corporate Card Override (2.5% Rate)", key=f"rule_btn_{ord_id}_{idx}", use_container_width=True):
-                                conn = get_db_connection(DEFAULT_DB_PATH)
-                                try:
-                                    conn.execute("""
-                                        INSERT OR REPLACE INTO resolved_rules (
-                                            rule_id, pattern_key, action, exception_code, description, created_at
-                                        ) VALUES (?, ?, 'APPROVE_CORPORATE_CARD_CHARGE', 'FEE_DEDUCTION', 'Corporate Card 2.5% MDR rate approved via Operator Console', datetime('now'));
-                                    """, (f"rule_{ord_id}", ord_id))
-                                    conn.commit()
-                                finally:
-                                    conn.close()
-                                
-                                execute_reconciliation_pipeline(DEFAULT_DB_PATH)
-                                st.toast(f"Override rule applied for {ord_id}! Ledger updated.", icon="✅")
-                                time.sleep(0.4)
-                                st.rerun()
-                        elif code == "UNSETTLED_PENDING":
-                            st.caption("Settlement In-Flight")
-                            st.info("Awaiting standard T+1 bank settlement window.")
-                        elif code == "AMOUNT_MISMATCH":
-                            st.caption("Partial Settlement / Refund")
-                            st.warning("Customer order modified after checkout completion.")
-                        elif code == "ORPHAN_SETTLEMENT":
-                            st.caption("Missing OMS Record")
-                            st.error("Payment settled in Razorpay without internal OMS record.")
-    else:
-        st.info("No exceptions recorded.")
-
-# ----------------- TAB 3: GST ITC AUDIT -----------------
-with tab3:
-    st.subheader("⚖️ GST Input Tax Credit (ITC) Protection (Section 16(2)(aa))")
-    st.markdown("""
-    Under Indian GST regulations, businesses can **only claim Input Tax Credit (ITC) that matches the supplier's physical tax invoice** 
-    reflected in GSTR-2B. When daily gateway micro-deductions diverge from the monthly invoice, merchants lose claimable tax credits.
-    """)
-
-    col_chart, col_audit = st.columns([3, 2])
-    with col_chart:
-        fig = go.Figure(data=[
-            go.Bar(
-                name="Daily Deductions Aggregate",
-                x=["GST Tax Value (INR)"],
-                y=[daily_gst_total],
-                marker_color="#ef4444",
-                text=[f"₹{daily_gst_total:,.2f}"],
-                textposition="auto"
-            ),
-            go.Bar(
-                name="Monthly Physical Invoice",
-                x=["GST Tax Value (INR)"],
-                y=[monthly_inv_gst],
-                marker_color="#0284c7",
-                text=[f"₹{monthly_inv_gst:,.2f}"],
-                textposition="auto"
+        with col_c1:
+            disc_counts = df_exc["discrepancy_code"].value_counts().reset_index()
+            disc_counts.columns = ["Discrepancy Code", "Count"]
+            fig_pie = px.pie(
+                disc_counts,
+                values="Count",
+                names="Discrepancy Code",
+                hole=0.45,
+                color_discrete_sequence=["#0284c7", "#f59e0b", "#ef4444", "#8b5cf6", "#10b981"],
+                title="Exceptions by Root Cause"
             )
-        ])
-        fig.update_layout(
-            barmode="group",
-            template="plotly_dark",
-            paper_bgcolor="rgba(15, 27, 46, 0.75)",
-            plot_bgcolor="rgba(15, 27, 46, 0.75)",
-            height=340,
-            margin=dict(l=20, r=20, t=30, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_audit:
-        st.markdown("### 📋 **ITC Audit Finding**")
-        st.write(f"• **Daily Deductions Sum:** `₹{daily_gst_total:,.2f}`")
-        st.write(f"• **Razorpay Invoice Total:** `₹{monthly_inv_gst:,.2f}`")
-        st.write(f"• **Identified Leakage:** `₹{gst_leakage:.2f}`")
-        
-        if gst_leakage > 0:
-            st.error(f"""
-            🚨 **Tax Over-Deduction Alert:**
-            Razorpay deducted **₹{gst_leakage:.2f}** more in daily transactions than stated on Monthly Tax Invoice `{df_gst['invoice_id'].iloc[0]}`.
-            
-            **Protection Action**: Auto-dispute claim drafted for the merchant to safeguard ITC.
-            """)
-        else:
-            st.success("✅ 100% Tax Credit claimable in GSTR-2B.")
-
-# ----------------- TAB 4: CONCURRENCY STRESS TESTER -----------------
-with tab4:
-    st.subheader("⚡ High-Volume Concurrency Stress-Tester")
-    st.markdown("""
-    **The Problem:** Traditional local databases lock and fail with `database is locked` errors during flash-sale webhook storms.
-    **The PaisaGuard Solution:** SQLite **Write-Ahead Logging (WAL)** + Atomic UPSERT logic allows parallel, non-blocking ingestion.
-    """)
-
-    num_threads = st.slider("Select Concurrent Webhook Worker Threads", min_value=10, max_value=100, value=50, step=10)
-    
-    if st.button(f"🔥 Flood Webhook Storm ({num_threads} Parallel Workers)", type="primary"):
-        status = st.empty()
-        status.info(f"Simulating network flood: Dispatching {num_threads} parallel threads against SQLite WAL...")
-        prog = st.progress(0)
-        
-        res = simulate_webhook_flood(DEFAULT_DB_PATH, num_threads=num_threads, use_wal=True)
-        prog.progress(100)
-        
-        status.success(f"✅ Stress-Test Complete! Successfully executed {res['successful_commits']}/{res['total_requests']} commits in {res['duration_seconds']}s with **ZERO database locks**!")
-
-        cp1, cp2 = st.columns([1, 1])
-        with cp1:
-            fig_pie = go.Figure(data=[go.Pie(
-                labels=["Successful Lock-Free Commits (WAL)", "Blocked / Lock Retries"],
-                values=[res["successful_commits"], res["lock_errors"]],
-                hole=0.6,
-                marker_colors=["#0284c7", "#ef4444"]
-            )])
             fig_pie.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(15, 27, 46, 0.75)",
-                height=300,
-                margin=dict(l=10, r=10, t=10, b=10)
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#f1f5f9"
             )
             st.plotly_chart(fig_pie, use_container_width=True)
-            
-        with cp2:
-            st.markdown("### 🏆 **Concurrency Benchmark Results**")
-            st.write(f"• **Database Engine**: SQLite 3 (WAL Mode)")
-            st.write(f"• **Parallel Worker Threads**: `{res['total_requests']}`")
-            st.write(f"• **Successful Commits**: `{res['successful_commits']} / {res['total_requests']}` (**100%**)")
-            st.write(f"• **Database Lock Contention**: `{res['lock_errors']} failures` (**0%**)")
-            st.write(f"• **Execution Duration**: `{res['duration_seconds']} seconds`")
-            st.write(f"• **Real-Time Throughput**: `{res['throughput_tps']} txns/sec`")
+
+        with col_c2:
+            disp_counts = df_exc["current_disposition"].value_counts().reset_index()
+            disp_counts.columns = ["Disposition", "Count"]
+            fig_bar = px.bar(
+                disp_counts,
+                x="Disposition",
+                y="Count",
+                color="Disposition",
+                color_discrete_map={"UNRESOLVED": "#f59e0b", "APPROVE": "#10b981", "REJECT": "#ef4444"},
+                title="Current Disposition Status"
+            )
+            fig_bar.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#f1f5f9"
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+    else:
+        st.success("🎉 All operational transactions and payout batches are 100% matched with zero open exceptions!")
+
+
+# -------------------------------------------------------------
+# SURFACE 2: PAYOUT TABLE
+# -------------------------------------------------------------
+with tab_payouts:
+    st.markdown("### Multi-Settlement Payout Batches & Bank Credits")
+    st.caption("Reconciles Razorpay batched merchant payouts against actual Bank Credit notifications (Pass 2).")
+
+    payouts_data = api_get("/payouts") or {}
+    payout_batches = payouts_data.get("payout_batches", [])
+    unmatched_credits = payouts_data.get("unmatched_bank_credits", [])
+
+    if payout_batches:
+        df_po = pd.DataFrame(payout_batches)
+        # Format rupee columns for readability
+        df_po_display = df_po.copy()
+        if "batch_net_paise" in df_po_display.columns:
+            df_po_display["Batch Net (₹)"] = df_po_display["batch_net_paise"].apply(lambda p: f"₹{p / 100:,.2f}")
+        if "bank_amount_paise" in df_po_display.columns:
+            df_po_display["Bank Credited (₹)"] = df_po_display["bank_amount_paise"].apply(
+                lambda p: f"₹{p / 100:,.2f}" if pd.notnull(p) else "Pending"
+            )
+        cols_to_show = [
+            col for col in ["payout_id", "settlement_count", "Batch Net (₹)", "bank_credit_id", "Bank Credited (₹)", "status", "discrepancy_code"]
+            if col in df_po_display.columns
+        ]
+        st.dataframe(df_po_display[cols_to_show], use_container_width=True, hide_index=True)
+    else:
+        st.info("No payout batches found in reconciliation ledger.")
+
+    if unmatched_credits:
+        st.markdown("---")
+        st.markdown("#### ⚠️ Unmatched Bank Credits Feed")
+        st.caption("Incoming bank deposits without a matching Razorpay payout batch identifier.")
+        df_unmatched = pd.DataFrame(unmatched_credits)
+        if "credit_amount_paise" in df_unmatched.columns:
+            df_unmatched["Amount (₹)"] = df_unmatched["credit_amount_paise"].apply(lambda p: f"₹{p / 100:,.2f}")
+        cols_un = [c for c in ["credit_id", "utr_number", "Amount (₹)", "status", "created_at"] if c in df_unmatched.columns]
+        st.dataframe(df_unmatched[cols_un], use_container_width=True, hide_index=True)
+
+
+# -------------------------------------------------------------
+# SURFACE 3: EXCEPTION EVIDENCE + AI RESPONSE DRAWER
+# -------------------------------------------------------------
+with tab_exceptions:
+    st.markdown("### Exception Investigation & Autonomous AI Agent")
+    st.caption("Detailed evidence view, citation verification, policy gate validation, and human approval workflow.")
+
+    exc_data = api_get("/exceptions") or {}
+    all_exceptions = exc_data.get("exceptions", [])
+
+    if not all_exceptions:
+        st.info("No open exceptions found in the system.")
+    else:
+        # Selector for exception
+        exc_options = {
+            f"Decision #{e['decision_id']} | {e['subject_type']} {e['subject_id']} ({e['discrepancy_code']}) - ₹{e['variance_paise'] / 100:,.2f}": e
+            for e in all_exceptions
+        }
+        selected_label = st.selectbox("Select Exception to Investigate", list(exc_options.keys()))
+        selected_exc = exc_options[selected_label]
+        dec_id = selected_exc["decision_id"]
+
+        col_left, col_right = st.columns([1, 1])
+
+        with col_left:
+            st.markdown("#### Structured Evidence Bundle")
+            st.markdown(f"**Decision ID**: `{dec_id}`")
+            st.markdown(f"**Subject**: `{selected_exc['subject_type']}` | `{selected_exc['subject_id']}`")
+            st.markdown(f"**Discrepancy Code**: `{selected_exc['discrepancy_code']}`")
+            st.markdown(f"**Variance**: `₹{selected_exc['variance_paise'] / 100:,.2f}` ({selected_exc['variance_paise']} paise)")
+            st.markdown(f"**Current Disposition**: `{selected_exc['current_disposition']}` (by `{selected_exc['resolved_by'] or 'UNRESOLVED'}`)")
+
+            # Parse evidence JSON
+            ev_raw = selected_exc.get("evidence", "{}")
+            try:
+                ev_obj = json.loads(ev_raw) if isinstance(ev_raw, str) else ev_raw
+                st.json(ev_obj)
+            except Exception:
+                st.text(str(ev_raw))
+
+        with col_right:
+            st.markdown("#### AI Exception Investigator")
+            st.caption("Read-only agent evaluates minimized evidence and returns structured diagnosis with citations.")
+
+            # Button to trigger AI investigation
+            investigate_btn = st.button("🤖 Run AI Agent Investigation", disabled=not token_configured, key=f"inv_{dec_id}")
+            if investigate_btn:
+                with st.spinner("Querying FinOps Agent and validating policy gate..."):
+                    success, inv_resp = api_post("/ai/investigate", {"decision_id": dec_id})
+                    if success:
+                        st.session_state[f"last_inv_{dec_id}"] = inv_resp
+                        st.success("Investigation complete!")
+                    else:
+                        st.error(f"Investigation failed: {inv_resp}")
+
+            # Display agent results if available
+            inv_result = st.session_state.get(f"last_inv_{dec_id}")
+            if inv_result:
+                conf = inv_result.get("confidence", 0.0)
+                conf_color = "#10b981" if conf >= 0.85 else ("#f59e0b" if conf >= 0.70 else "#ef4444")
+                st.markdown(f"""
+                <div style="background: rgba(15, 23, 42, 0.9); border: 1px solid #1e3a5f; border-radius: 8px; padding: 14px; margin-top: 10px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-weight: 700; color: #38bdf8;">ACTION: {inv_result.get('recommended_action')}</span>
+                        <span style="background: {conf_color}; color: #000; font-weight: 800; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem;">
+                            CONFIDENCE: {int(conf * 100)}%
+                        </span>
+                    </div>
+                    <p style="margin-top: 8px; font-size: 0.9rem; color: #cbd5e1;">{inv_result.get('diagnosis')}</p>
+                    <div style="margin-top: 6px; font-size: 0.78rem; color: #94a3b8;">
+                        <strong>Policy Gate Status:</strong> {'✅ PASSED' if inv_result.get('policy_gate_passed') else '❌ REJECTED'}
+                    </div>
+                    <div style="margin-top: 4px; font-size: 0.78rem; color: #94a3b8;">
+                        <strong>Cited Records:</strong> <code>{', '.join(inv_result.get('cited_record_ids', []))}</code>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Human Approval / Rejection Action Area
+            st.markdown("---")
+            st.markdown("#### Human Operator Action")
+            notes = st.text_area("Audit Justification / Notes", value="Verified against partner contract specifications.", key=f"notes_{dec_id}")
+
+            col_act1, col_act2 = st.columns(2)
+            with col_act1:
+                if st.button("✅ Approve Recommendation", disabled=not token_configured, key=f"app_{dec_id}", use_container_width=True):
+                    succ, res = api_post("/approvals/decision", {
+                        "decision_id": dec_id,
+                        "action": "APPROVE",
+                        "reviewer": reviewer_id,
+                        "notes": notes
+                    })
+                    if succ:
+                        st.success(f"Approval recorded! Approval ID: {res.get('approval_id')}")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"Approval failed: {res}")
+            with col_act2:
+                if st.button("❌ Reject / Escalate", disabled=not token_configured, key=f"rej_{dec_id}", use_container_width=True):
+                    succ, res = api_post("/approvals/decision", {
+                        "decision_id": dec_id,
+                        "action": "REJECT",
+                        "reviewer": reviewer_id,
+                        "notes": notes
+                    })
+                    if succ:
+                        st.success(f"Rejection recorded! Approval ID: {res.get('approval_id')}")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"Action failed: {res}")
+
+
+# -------------------------------------------------------------
+# SURFACE 4: HUMAN APPROVAL TIMELINE
+# -------------------------------------------------------------
+with tab_approvals:
+    st.markdown("### Immutable Audit & Approval Trail")
+    st.caption("Strictly append-only log of every state change, human sign-off, and deterministic policy transition.")
+
+    audit_data = api_get("/audit-events") or {}
+    human_approvals = audit_data.get("human_approvals", [])
+    audit_events = audit_data.get("audit_events", [])
+
+    col_a1, col_a2 = st.columns([1, 1])
+    with col_a1:
+        st.markdown("#### Human Approvals")
+        if human_approvals:
+            df_app = pd.DataFrame(human_approvals)
+            cols_show = [c for c in ["approval_id", "decision_id", "action", "reviewer", "notes", "created_at"] if c in df_app.columns]
+            st.dataframe(df_app[cols_show], use_container_width=True, hide_index=True)
+        else:
+            st.info("No human approvals recorded yet.")
+
+    with col_a2:
+        st.markdown("#### System Audit Events")
+        if audit_events:
+            df_ev = pd.DataFrame(audit_events)
+            cols_ev = [c for c in ["event_id", "event_type", "aggregate_id", "created_at"] if c in df_ev.columns]
+            st.dataframe(df_ev[cols_ev], use_container_width=True, hide_index=True)
+        else:
+            st.info("No system audit events recorded.")
+
+
+# -------------------------------------------------------------
+# SURFACE 5: BENCHMARK & ACCURACY REPORT
+# -------------------------------------------------------------
+with tab_benchmarks:
+    st.markdown("### Automated Benchmark & Accuracy Console")
+    st.caption("Measured throughput, latency percentiles, and machine learning accuracy on 30 held-out evaluation transactions.")
+
+    report_data = api_get("/evaluation-report") or {}
+    if report_data.get("status") == "not_generated":
+        st.warning("⚠️ Benchmark evaluation report has not been generated yet. Run `python eval_benchmarks.py` or trigger from CLI.")
+    else:
+        perf = report_data.get("performance_benchmarks", {})
+        acc = report_data.get("accuracy_benchmarks", {})
+        env_spec = report_data.get("system_environment", {})
+
+        col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+        with col_b1:
+            st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title">Throughput</div>
+                <div class="kpi-value" style="color: #38bdf8;">{perf.get('records_per_second', 0.0):,.1f}</div>
+                <div class="kpi-sub">records / second</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_b2:
+            st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title">Latency (p50 / p95)</div>
+                <div class="kpi-value">{perf.get('p50_latency_ms', 0.0):.1f} <span style="font-size: 1rem; color: #94a3b8;">/ {perf.get('p95_latency_ms', 0.0):.1f}ms</span></div>
+                <div class="kpi-sub">deterministic sweep latency</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_b3:
+            st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title">AI Held-Out Accuracy</div>
+                <div class="kpi-value" style="color: #34d399;">{acc.get('ai_agent_evaluation', {}).get('held_out_accuracy_percent', 0.0)}%</div>
+                <div class="kpi-sub">on 30 held-out ground truth txns</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_b4:
+            st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title">Abstention Fidelity</div>
+                <div class="kpi-value" style="color: #34d399;">{acc.get('ai_agent_evaluation', {}).get('deliberate_abstention_fidelity_percent', 0.0)}%</div>
+                <div class="kpi-sub">zero hallucinated actions</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("---")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.markdown("#### Deterministic Matcher Metrics")
+            dm = acc.get("deterministic_matcher", {})
+            st.markdown(f"- **Coverage**: `{dm.get('coverage_percent', 0.0)}%`")
+            st.markdown(f"- **Precision**: `{dm.get('precision_percent', 0.0)}%`")
+            st.markdown(f"- **Recall**: `{dm.get('recall_percent', 0.0)}%`")
+            st.markdown(f"- **F1 Score**: `{dm.get('f1_score', 0.0)}`")
+            st.markdown(f"- **False Positives**: `{dm.get('false_positives', 0)}`")
+
+        with col_m2:
+            st.markdown("#### System & Environment Metadata")
+            st.markdown(f"- **Platform**: `{env_spec.get('platform')}`")
+            st.markdown(f"- **CPU Cores**: `{env_spec.get('cpu_cores')}`")
+            st.markdown(f"- **Python Version**: `{env_spec.get('python_version')}`")
+            st.markdown(f"- **SQLite Journal Mode**: `{env_spec.get('sqlite_journal_mode')}`")
+            st.markdown(f"- **Git SHA**: `{env_spec.get('git_sha')}`")
+            st.markdown(f"- **Dataset Seed Hash**: `{report_data.get('dataset_seed_hash', 'N/A')[:32]}...`")
+
+        with st.expander("📄 View Full JSON Benchmark Report"):
+            st.json(report_data)

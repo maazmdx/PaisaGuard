@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PaisaGuard One-Click Reproducible Demo Launcher
-# Proves system integrity, sets up database, and boots services with health checks.
+# Proves system integrity, sets up database, runs benchmarks, and boots services with health checks.
 
 set -eo pipefail
 
@@ -12,7 +12,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}=====================================================================${NC}"
-echo -e "${BLUE}              PAISAGUARD LOCAL OPERATIONS DEMO LAUNCHER              ${NC}"
+echo -e "${BLUE}          PAISAGUARD REPRODUCIBLE OPERATIONS DEMO LAUNCHER           ${NC}"
 echo -e "${BLUE}=====================================================================${NC}"
 
 # Check Python version
@@ -36,30 +36,48 @@ else
     fi
     source .venv/bin/activate
 
-    echo -e "\n[2/5] Checking package dependencies from PyPI..."
-    pip install -q --upgrade pip
+    echo -e "\n[2/5] Verifying dependencies from PyPI..."
     pip install -q -r requirements.txt
 fi
 
-echo -e "\n[3/5] Generating synthetic datasets & seeding SQLite DB (WAL Mode)..."
-python3 seed_data.py
+# Configure local demo token if unset
+export PAISAGUARD_API_TOKEN="${PAISAGUARD_API_TOKEN:-pg_token_buildathon_demo_2026}"
+echo -e "-> PaisaGuard API Security Token: [CONFIGURED]"
 
-echo -e "\n[4/5] Executing automated verification tests..."
-python3 -m unittest test_reconciliation.py
+echo -e "\n[3/5] Generating synthetic 3-source dataset & seeding SQLite (WAL Mode)..."
+python3 seed_data.py --reset
+
+echo -e "\n[4/5] Executing automated verification test suite & benchmarks..."
+pytest -q
+python3 eval_benchmarks.py
 
 echo -e "\n[5/5] Booting background payment gateway services..."
 
-# Ensure ports 8001 and 8501 are not currently blocked
-if command -v lsof &>/dev/null; then
-    if lsof -Pi :8001 -sTCP:LISTEN -t &>/dev/null; then
-        echo -e "${YELLOW}Notice: Port 8001 is already in use. Cleaning up stale process...${NC}"
-        kill -9 $(lsof -t -i:8001) 2>/dev/null || true
+# Safe Port Check Helper (never kills arbitrary processes)
+check_port_safe() {
+    local port=$1
+    local name=$2
+    if command -v lsof &>/dev/null; then
+        local pid
+        pid=$(lsof -Pi :"$port" -sTCP:LISTEN -t 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            local cmd
+            cmd=$(ps -p "$pid" -o args= 2>/dev/null || true)
+            if echo "$cmd" | grep -qE "uvicorn|streamlit|api:app"; then
+                echo -e "${YELLOW}Notice: Terminating prior PaisaGuard $name process (PID $pid)...${NC}"
+                kill "$pid" 2>/dev/null || true
+                sleep 1
+            else
+                echo -e "${RED}Error: Port $port ($name) is currently bound by another application (PID $pid: $cmd).${NC}"
+                echo -e "${RED}Please free port $port before launching the demo.${NC}"
+                exit 1
+            fi
+        fi
     fi
-    if lsof -Pi :8501 -sTCP:LISTEN -t &>/dev/null; then
-        echo -e "${YELLOW}Notice: Port 8501 is already in use. Cleaning up stale process...${NC}"
-        kill -9 $(lsof -t -i:8501) 2>/dev/null || true
-    fi
-fi
+}
+
+check_port_safe 8001 "FastAPI Gateway"
+check_port_safe 8501 "Streamlit Console"
 
 # Determine bind host (0.0.0.0 ensures external container port mapping works)
 BIND_HOST="${PAISAGUARD_HOST:-0.0.0.0}"
@@ -69,25 +87,35 @@ echo -e "-> Starting FastAPI Webhook Ingestion on port 8001 (${BIND_HOST})..."
 uvicorn api:app --port 8001 --host "$BIND_HOST" > /dev/null 2>&1 &
 API_PID=$!
 
+# Cleanup trap
+cleanup() {
+    echo -e "\n${YELLOW}Stopping PaisaGuard background servers...${NC}"
+    kill "$API_PID" 2>/dev/null || true
+    if [ -n "${STREAMLIT_PID:-}" ]; then
+        kill "$STREAMLIT_PID" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap cleanup INT TERM EXIT
+
 # Wait for FastAPI to be ready
 echo -e "-> Waiting for FastAPI gateway readiness..."
 MAX_WAIT=20
 for i in $(seq 1 $MAX_WAIT); do
     if curl -sf http://127.0.0.1:8001/ > /dev/null 2>&1; then
-        echo -e "-> FastAPI gateway is UP and responding (attempt ${i})."
+        echo -e "-> FastAPI gateway is UP and responding."
         break
     fi
     sleep 1
-    if [ $i -eq $MAX_WAIT ]; then
+    if [ "$i" -eq $MAX_WAIT ]; then
         echo -e "${RED}Error: FastAPI gateway did not start within ${MAX_WAIT}s.${NC}"
-        kill $API_PID 2>/dev/null || true
         exit 1
     fi
 done
 
-# Replay simulated webhooks to prove real-time ingestion (Hex & Base64)
+# Replay simulated webhooks to prove real-time ingestion (Hex & Base64 with canonical integer paise)
 echo -e "-> Replaying sample signed webhook payload (Hex HMAC)..."
-PAYLOAD_HEX='{"event":"payment.captured","payload":{"payment":{"entity":{"id":"pay_capt_demo_hex","amount":150000,"currency":"INR","order_id":"ord_in_1001","status":"captured"}}}}'
+PAYLOAD_HEX='{"event":"payment.captured","payment_id":"pay_demo_signed_hex","order_id":"ord_in_1001","amount_paise":150000,"currency":"INR","status":"captured"}'
 SIG_HEX=$(python3 -c "import hmac, hashlib; print(hmac.new(b'rzp_sec_buildathon_2026_demo', b'$PAYLOAD_HEX', hashlib.sha256).hexdigest())")
 curl -s -X POST http://127.0.0.1:8001/webhooks/razorpay \
      -H "Content-Type: application/json" \
@@ -95,7 +123,7 @@ curl -s -X POST http://127.0.0.1:8001/webhooks/razorpay \
      -d "$PAYLOAD_HEX" > /dev/null || true
 
 echo -e "-> Replaying sample signed webhook payload (Base64 HMAC)..."
-PAYLOAD_B64='{"event":"payment.captured","payment_id":"pay_capt_demo_b64","order_id":"ord_in_1002","amount":2450.00,"fee":49.00,"tax":8.82,"payment_method":"card"}'
+PAYLOAD_B64='{"event":"payment.captured","payment_id":"pay_demo_signed_b64","order_id":"ord_in_1002","amount_paise":245000,"fee_paise":4900,"tax_paise":882,"payment_method":"card"}'
 SIG_B64=$(python3 -c "import hmac, hashlib, base64; d=hmac.new(b'rzp_sec_buildathon_2026_demo', b'$PAYLOAD_B64', hashlib.sha256).digest(); print(base64.b64encode(d).decode())")
 curl -s -X POST http://127.0.0.1:8001/webhooks/razorpay \
      -H "Content-Type: application/json" \
@@ -111,11 +139,11 @@ STREAMLIT_PID=$!
 echo -e "-> Waiting for Streamlit dashboard readiness..."
 for i in $(seq 1 $MAX_WAIT); do
     if curl -sf http://127.0.0.1:8501/_stcore/health > /dev/null 2>&1 || curl -sf http://127.0.0.1:8501/ > /dev/null 2>&1; then
-        echo -e "-> Streamlit visual dashboard is UP and ready (attempt ${i})."
+        echo -e "-> Streamlit visual dashboard is UP and ready."
         break
     fi
     sleep 1
-    if [ $i -eq $MAX_WAIT ]; then
+    if [ "$i" -eq $MAX_WAIT ]; then
         echo -e "${YELLOW}Warning: Streamlit readiness check timed out; continuing...${NC}"
     fi
 done
@@ -128,6 +156,5 @@ echo -e "Streamlit Visual Console: http://localhost:8501"
 echo -e "Press [CTRL+C] to gracefully stop both servers."
 echo -e "${GREEN}=====================================================================${NC}"
 
-# Wait for interrupt to clean up background processes
-trap "echo -e '\nStopping background servers...'; kill $API_PID $STREAMLIT_PID 2>/dev/null || true; exit 0" INT TERM
+# Wait indefinitely for signal
 wait
