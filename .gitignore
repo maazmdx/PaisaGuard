@@ -67,10 +67,7 @@ venv.bak/
 *.sqlite
 *.sqlite3
 
-# Operating System & IDE artifacts
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-*.swp
-*.swo
+# Output artifacts (generated at runtime and CI)
+out/*
+!out/.gitkeep
+

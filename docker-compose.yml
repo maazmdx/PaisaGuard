@@ -1,25 +1,68 @@
-version: '3.8'
-
 services:
-  paisaguard:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: paisaguard_app
+  # Root-only volume permission initialization ensuring UID:GID 1000 has write access on fresh volumes
+  volume-perms:
+    image: alpine:3.19
+    user: "0:0"
+    command: sh -c "mkdir -p /app/data /app/out && chown -R 1000:1000 /app/data /app/out"
+    volumes:
+      - db-data:/app/data
+
+  # Explicit demo fixture reset: runs seed_data.py --reset only when --profile demo is invoked
+  demo-init:
+    profiles: ["demo"]
+    build: .
+    user: "1000:1000"
+    command: python seed_data.py --reset
+    volumes:
+      - db-data:/app/data
+    environment:
+      - PAISAGUARD_DB_PATH=/app/data/reconciliation.db
+    depends_on:
+      volume-perms:
+        condition: service_completed_successfully
+
+  # FastAPI Webhook Ingestion & Reconciliation Service
+  api:
+    build: .
+    user: "1000:1000"
+    command: uvicorn api:app --host 0.0.0.0 --port 8001
     ports:
       - "8001:8001"
-      - "8501:8501"
-    environment:
-      - PAISAGUARD_ENV=development
-      - PAISAGUARD_IN_CONTAINER=1
-      - PAISAGUARD_HOST=0.0.0.0
-      - RAZORPAY_WEBHOOK_SECRET=rzp_sec_buildathon_2026_demo
+    depends_on:
+      volume-perms:
+        condition: service_completed_successfully
     volumes:
-      - ./out:/app/out
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8001/ && curl -f http://localhost:8501/ || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-    restart: unless-stopped
+      - db-data:/app/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - PAISAGUARD_DB_PATH=/app/data/reconciliation.db
+      - PAISAGUARD_ENV=${PAISAGUARD_ENV:-development}
+      - PAISAGUARD_API_TOKEN=${PAISAGUARD_API_TOKEN:-}
+      - PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS=${PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS:-false}
+      - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET:-}
+      - AI_PROVIDER=${AI_PROVIDER:-mock}
+      - AI_MODEL=${AI_MODEL:-gemini-2.5-flash}
+      - AI_API_KEY=${AI_API_KEY:-}
+
+  # Streamlit FinOps Evaluator Console
+  # Isolated frontend: ZERO direct SQLite access; communicates 100% via FastAPI HTTP API
+  dashboard:
+    build: .
+    user: "1000:1000"
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_started
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - API_URL=http://api:8001
+      - PAISAGUARD_API_TOKEN=${PAISAGUARD_API_TOKEN:-}
+
+volumes:
+  db-data:

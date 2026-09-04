@@ -1,9 +1,0 @@
-order_id,payment_id,exception_code,variance,exception_msg,status
-ord_in_1042,pay_rzp_800042,FEE_DEDUCTION,27.45,Gateway deducted ₹137.25 fee (expected ₹109.80 @ 2.0% MDR). Suspected Corporate Card Rate (2.5%).,UNRESOLVED
-ord_in_1077,pay_rzp_800077,FEE_DEDUCTION,62.5,Gateway deducted ₹312.50 fee (expected ₹250.00 @ 2.0% MDR). Suspected Corporate Card Rate (2.5%).,UNRESOLVED
-ord_in_1085,pay_rzp_800085,AMOUNT_MISMATCH,500.0,Gross amount mismatch: OMS ₹7999.00 vs Settlement ₹7499.00.,DISCREPANCY
-ord_in_1091,pay_rzp_800091,FEE_DEDUCTION,4.5,Gateway deducted ₹22.48 fee (expected ₹17.98 @ 2.0% MDR). Suspected Corporate Card Rate (2.5%).,UNRESOLVED
-ord_in_1098,N/A,UNSETTLED_PENDING,1299.5,Order ord_in_1098 captured in OMS but pending gateway settlement.,PENDING
-ord_in_1099,N/A,UNSETTLED_PENDING,1599.0,Order ord_in_1099 captured in OMS but pending gateway settlement.,PENDING
-ord_unrecorded_901,pay_rzp_orphan_901,ORPHAN_SETTLEMENT,2500.0,Payment pay_rzp_orphan_901 settled by Razorpay without corresponding internal OMS order.,AUDIT_REQUIRED
-ord_unrecorded_902,pay_rzp_orphan_902,ORPHAN_SETTLEMENT,4200.0,Payment pay_rzp_orphan_902 settled by Razorpay without corresponding internal OMS order.,AUDIT_REQUIRED
