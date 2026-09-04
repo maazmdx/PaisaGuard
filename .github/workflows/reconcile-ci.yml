@@ -11,70 +11,70 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Codebase
-      uses: actions/checkout@v4
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
 
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-        cache: 'pip'
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Code Quality & Linting
-      run: |
-        ruff check .
+      - name: Code Quality & Linting
+        run: |
+          ruff check .
 
-    - name: Database Initialization & Synthetic Data Seeding
-      env:
-        GIT_SHA: ${{ github.sha }}
-      run: |
-        python seed_data.py --reset
+      - name: Database Initialization & Synthetic Data Seeding
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          python seed_data.py --reset
 
-    - name: Execute Full Pytest Harness (39 Tests)
-      run: |
-        pytest -v
+      - name: Execute Full Pytest Harness (39 Tests)
+        run: |
+          pytest -v
 
-    - name: Run Reconciliation Benchmark & Accuracy Evaluation
-      env:
-        GIT_SHA: ${{ github.sha }}
-        PAISAGUARD_CI: "1"
-      run: |
-        python eval_benchmarks.py
+      - name: Run Reconciliation Benchmark & Accuracy Evaluation
+        env:
+          GIT_SHA: ${{ github.sha }}
+          PAISAGUARD_CI: "1"
+        run: |
+          python eval_benchmarks.py
 
-    - name: Verify Reconciled Outputs & Reports Exist
-      run: |
-        for file in out/final-matched-ledger.csv out/final-exception-queue.csv out/recon-run-summary.json out/evaluation-report.json out/evaluation-report.md; do
-          if [ ! -f "$file" ]; then
-            echo "Error: Required artifact $file is missing!"
-            exit 1
-          fi
-        done
-        echo "All reconciliation outputs and evaluation reports verified successfully!"
+      - name: Verify Reconciled Outputs & Reports Exist
+        run: |
+          for file in out/final-matched-ledger.csv out/final-exception-queue.csv out/recon-run-summary.json out/evaluation-report.json out/evaluation-report.md; do
+            if [ ! -f "$file" ]; then
+              echo "Error: Required artifact $file is missing!"
+              exit 1
+            fi
+          done
+          echo "All reconciliation outputs and evaluation reports verified successfully!"
 
-    - name: Upload Reconciled Audit & Benchmark Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: paisaguard-benchmark-artifacts
-        path: out/
+      - name: Upload Reconciled Audit & Benchmark Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paisaguard-benchmark-artifacts
+          path: out/
 
-    - name: Print Benchmark Summary
-      run: |
-        echo "=== PaisaGuard Benchmark Summary ==="
-        python -c "
-        import json
-        with open('out/evaluation-report.json') as f:
-            d = json.load(f)
-        p = d.get('performance_benchmarks', {})
-        a = d.get('accuracy_benchmarks', {})
-        dm = a.get('deterministic_matcher', {})
-        ai = a.get('ai_agent_evaluation', {})
-        print(f\"Throughput: {p.get('records_per_second', 0):.2f} rec/s (p50: {p.get('p50_latency_ms', 0):.2f}ms, p95: {p.get('p95_latency_ms', 0):.2f}ms)\")
-        print(f\"Matcher: Coverage={dm.get('coverage_percent')}% Precision={dm.get('precision_percent')}% Recall={dm.get('recall_percent')}%\")
-        print(f\"AI Agent: Accuracy={ai.get('held_out_accuracy_percent')}% Abstention Fidelity={ai.get('deliberate_abstention_fidelity_percent')}%\")
-        print(f\"Final Resolution Accuracy: {a.get('final_resolution_accuracy', {}).get('resolution_accuracy_percent')}%\")
-        "
+      - name: Print Benchmark Summary
+        run: |
+          echo "=== PaisaGuard Benchmark Summary ==="
+          python -c "
+          import json
+          with open('out/evaluation-report.json') as f:
+              d = json.load(f)
+          p = d.get('performance_benchmarks', {})
+          a = d.get('accuracy_benchmarks', {})
+          dm = a.get('deterministic_matcher', {})
+          ai = a.get('ai_agent_evaluation', {})
+          print(f\"Throughput: {p.get('records_per_second', 0):.2f} rec/s (p50: {p.get('p50_latency_ms', 0):.2f}ms, p95: {p.get('p95_latency_ms', 0):.2f}ms)\")
+          print(f\"Matcher: Coverage={dm.get('coverage_percent')}% Precision={dm.get('precision_percent')}% Recall={dm.get('recall_percent')}%\")
+          print(f\"AI Agent: Accuracy={ai.get('held_out_accuracy_percent')}% Abstention Fidelity={ai.get('deliberate_abstention_fidelity_percent')}%\")
+          print(f\"Final Resolution Accuracy: {a.get('final_resolution_accuracy', {}).get('resolution_accuracy_percent')}%\")
+          "
