@@ -1,22 +1,50 @@
+"""
+api.py — FastAPI FinOps Webhook Gateway, Reconcile Controller & AI Diagnosis API.
+
+Architectural Guarantees:
+1. Fail-Closed Token Security:
+   - PAISAGUARD_API_TOKEN is required for state-changing endpoints (/reconcile/sweep, /ai/investigate, /approvals/decision).
+   - If PAISAGUARD_API_TOKEN is unset, all state mutations fail closed (HTTP 503).
+   - Validated via constant-time hmac.compare_digest.
+2. Canonical Currency:
+   - Webhook payloads strictly require integer `*_paise` fields (e.g. amount_paise: int).
+3. Webhook Deduplication:
+   - Deduplicated by unique event_id in webhook_events. Replay of identical event_id returns duplicate_ignored.
+4. HMAC-SHA256 Signature Policy:
+   - Enforced by default in all environments.
+   - Unsigned requests permitted ONLY if PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS=true.
+5. Zero Secret Logging:
+   - Secrets, tokens, and prefixes are NEVER printed or logged.
+6. Isolated Dashboard API:
+   - Exposes clean read endpoints (/metrics, /payouts, /exceptions, /audit-events, /evaluation-report)
+     allowing the Streamlit dashboard to operate with zero direct SQLite volume access.
+"""
+
 import os
+import sys
 import hmac
 import hashlib
 import base64
 import json
 import time
 import logging
-import sqlite3
-from typing import Dict, Any, Optional, Tuple
-from decimal import Decimal
+from typing import Dict, Any, Optional, Tuple, List
 from collections import defaultdict
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header, Request, Response, Depends, status
 from pydantic import BaseModel, Field
-from pathlib import Path
-from db import get_db_connection, get_db_cursor, DEFAULT_DB_PATH
-from recon_engine import execute_reconciliation_pipeline
-from money import to_decimal, round_curr
 
-# Configure Structured Logging
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from db import get_db_connection, get_db_cursor, get_db_path, log_audit_event
+from recon_engine import execute_reconciliation_pipeline
+from exception_agent import investigate_exception
+from audit_service import record_human_approval
+from money import require_paise, paise_to_rupees, format_paise_inr
+
+# Configure Structured JSON Logging without secret leakage
 logging.basicConfig(
     level=logging.INFO,
     format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"paisaguard-api","message":%(message)s}'
@@ -24,28 +52,21 @@ logging.basicConfig(
 logger = logging.getLogger("paisaguard.gateway")
 
 app = FastAPI(
-    title="PaisaGuard Gateway",
-    description="Deterministic Financial Reconciliation, HMAC Ingestion & AI Diagnostic Engine",
-    version="2.2.0"
+    title="PaisaGuard FinOps Engine",
+    description="3-Source Financial Reconciliation, HMAC Ingestion & AI Diagnostic Controller",
+    version="3.0.0"
 )
 
-# Webhook Secret & Environment Configuration
+# Security Configuration
 ENVIRONMENT = os.environ.get("PAISAGUARD_ENV", "development").lower()
-RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "rzp_sec_buildathon_2026_demo")
-PAISAGUARD_REQUIRE_HMAC = os.environ.get("PAISAGUARD_REQUIRE_HMAC", "").lower() in ("1", "true", "yes")
 PAISAGUARD_API_TOKEN = os.environ.get("PAISAGUARD_API_TOKEN", "")
+PAISAGUARD_DEMO_ALLOW_UNSIGNED = os.environ.get("PAISAGUARD_DEMO_ALLOW_UNSIGNED_WEBHOOKS", "false").lower() in ("1", "true", "yes")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
-if ENVIRONMENT == "production" and RAZORPAY_WEBHOOK_SECRET == "rzp_sec_buildathon_2026_demo":
-    raise RuntimeError("CRITICAL SECURITY VIOLATION: Default demo webhook secret cannot be used in production environment!")
 
-
-# In-Memory Sliding-Window Rate Limiter
+# Sliding-Window Rate Limiter
 class InMemoryRateLimiter:
-    """
-    Sliding-window in-memory rate limiter per IP address.
-    Default: max 120 requests per 60-second window.
-    """
-    def __init__(self, max_requests: int = 120, window_seconds: float = 60.0):
+    def __init__(self, max_requests: int = 200, window_seconds: float = 60.0):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.requests = defaultdict(list)
@@ -59,35 +80,36 @@ class InMemoryRateLimiter:
         self.requests[client_ip].append(now)
         return True, self.max_requests - len(self.requests[client_ip])
 
-rate_limiter = InMemoryRateLimiter(max_requests=120, window_seconds=60.0)
+
+rate_limiter = InMemoryRateLimiter(max_requests=200, window_seconds=60.0)
 
 
-def verify_admin_token(x_paisaguard_token: Optional[str] = Header(None)):
+def verify_api_token(x_paisaguard_token: Optional[str] = Header(None)):
     """
-    Optional administrative token guard for CFO / Operations controls.
-    Active only when PAISAGUARD_API_TOKEN environment variable is set.
+    Fail-closed token verification for state-changing FinOps endpoints.
+    If PAISAGUARD_API_TOKEN is unset on the server, all calls fail closed (HTTP 503).
     """
-    if PAISAGUARD_API_TOKEN:
-        if not x_paisaguard_token or not hmac.compare_digest(x_paisaguard_token, PAISAGUARD_API_TOKEN):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Valid X-PaisaGuard-Token header is required to access administrative FinOps controls."
-            )
+    expected_token = os.environ.get("PAISAGUARD_API_TOKEN", PAISAGUARD_API_TOKEN)
+    if not expected_token:
+        logger.error('{"event":"auth_rejection","reason":"server_token_unset"}')
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="FinOps Security Policy: Server PAISAGUARD_API_TOKEN is not configured. Protected write actions are disabled."
+        )
+
+    if not x_paisaguard_token or not hmac.compare_digest(x_paisaguard_token, expected_token):
+        logger.warning('{"event":"auth_rejection","reason":"invalid_or_missing_token"}')
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Valid X-PaisaGuard-Token header is required for this operation."
+        )
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str], secret: str) -> Tuple[bool, str]:
     """
-    Stateless, importable HMAC-SHA256 verification supporting both Hex and Base64 encodings,
-    optional 'sha256=' prefix, whitespace stripping, and case insensitivity.
-
-    Compute the HMAC digest bytes ONCE and derive both representations from that
-    single computation, avoiding any ambiguity from calling .hexdigest() and
-    .digest() sequentially on the same HMAC object.
-
-    Returns:
-        (verified: bool, encoding_used: str)  -- encoding_used is 'hex', 'base64', or 'none'
+    Constant-time HMAC-SHA256 verification supporting Hex and Base64 encodings.
     """
-    if not signature_header or not isinstance(signature_header, str):
+    if not signature_header or not secret:
         return False, "none"
 
     clean_sig = signature_header.strip()
@@ -99,19 +121,15 @@ def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str], s
     if not clean_sig:
         return False, "none"
 
-    digest_bytes = hmac.new(
-        secret.encode("utf-8"),
-        raw_body,
-        hashlib.sha256
-    ).digest()
-    expected_hex = digest_bytes.hex()                              # 64 lowercase hex chars
-    expected_b64 = base64.b64encode(digest_bytes).decode("utf-8") # 44 base64 chars with =
+    digest_bytes = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    expected_hex = digest_bytes.hex()
+    expected_b64 = base64.b64encode(digest_bytes).decode("utf-8")
 
     # 1. Hex comparison (case-insensitive)
     if hmac.compare_digest(clean_sig.lower(), expected_hex):
         return True, "hex"
 
-    # 2. Base64 comparison (standard and URL-safe)
+    # 2. Base64 comparison (standard & url-safe)
     if hmac.compare_digest(clean_sig, expected_b64):
         return True, "base64"
 
@@ -122,74 +140,46 @@ def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str], s
     return False, "none"
 
 
-class WebhookPayload(BaseModel):
-    event: str = Field(..., json_schema_extra={"example": "payment.captured"})
+# Pydantic Request Models with Strict Integer Paise
+class RazorpayWebhookPayload(BaseModel):
+    event_id: str = Field(..., json_schema_extra={"example": "evt_rzp_9901"})
+    event: str = Field("payment.captured", json_schema_extra={"example": "payment.captured"})
     payment_id: str = Field(..., json_schema_extra={"example": "pay_rzp_9901"})
     order_id: Optional[str] = Field(None, json_schema_extra={"example": "ord_in_1050"})
-    amount: Decimal = Field(..., json_schema_extra={"example": "1500.00"})
-    fee: Optional[Decimal] = Field(Decimal("0.00"), json_schema_extra={"example": "30.00"})
-    tax: Optional[Decimal] = Field(Decimal("0.00"), json_schema_extra={"example": "5.40"})
+    payout_id: Optional[str] = Field(None, json_schema_extra={"example": "payout_aug_01"})
+    amount_paise: int = Field(..., description="Payment amount in canonical integer paise", json_schema_extra={"example": 150000})
+    fee_paise: Optional[int] = Field(0, description="Deducted gateway fee in integer paise", json_schema_extra={"example": 3000})
+    tax_paise: Optional[int] = Field(0, description="Deducted GST tax in integer paise", json_schema_extra={"example": 540})
     payment_method: Optional[str] = Field("upi", json_schema_extra={"example": "upi"})
 
 
-class RuleOverrideRequest(BaseModel):
-    rule_id: str
-    pattern_key: str
-    action: str = "APPROVE_CORPORATE_CARD_CHARGE"
-    exception_code: str = "FEE_DEDUCTION"
-    description: str = "Manual override rule approved via API"
+class AIInvestigateRequest(BaseModel):
+    decision_id: int = Field(..., description="ID of reconciliation decision to investigate")
 
 
-class AIDiagnosticRequest(BaseModel):
-    order_id: str
-    payment_id: str
-    gross_amount: Decimal
-    actual_fee: Decimal
-    expected_fee: Decimal
-    exception_code: str
-
-
-class AIDiagnosticResponse(BaseModel):
-    order_id: str
-    classification: str
-    confidence: float
-    suggested_action: str
-    policy_approved: bool
-    policy_reason: str
-
-
-# Deterministic Policy Gatekeeper (Trust Boundary Enforcement)
-class PolicyGatekeeper:
-    MAX_ALLOWABLE_OVERRIDE_INR = Decimal("50.00")
-    MAX_ALLOWABLE_MDR_RATE = Decimal("0.035")  # 3.5% absolute economic ceiling
-
-    @classmethod
-    def evaluate(cls, gross_amount: Decimal, actual_fee: Decimal, expected_fee: Decimal, suggested_action: str) -> tuple[bool, str]:
-        variance = abs(actual_fee - expected_fee)
-        if variance > cls.MAX_ALLOWABLE_OVERRIDE_INR:
-            return False, f"Fee discrepancy ₹{variance:.2f} exceeds hard safety ceiling of ₹{cls.MAX_ALLOWABLE_OVERRIDE_INR:.2f}. Manual CFO sign-off required."
-
-        if gross_amount > Decimal("0"):
-            effective_mdr = actual_fee / gross_amount
-        else:
-            effective_mdr = Decimal("0.0")
-
-        if effective_mdr > cls.MAX_ALLOWABLE_MDR_RATE:
-            return False, f"Effective MDR {effective_mdr*100:.2f}% breaches merchant contract cap {cls.MAX_ALLOWABLE_MDR_RATE*100:.2f}%."
-
-        return True, "Deterministic Policy Gatekeeper: Verified within safe economic bounds."
+class HumanApprovalRequest(BaseModel):
+    decision_id: int = Field(..., description="ID of reconciliation decision being resolved")
+    action: str = Field(..., description="Action: APPROVE, REJECT, ESCALATE, or OVERRIDE")
+    reviewer: str = Field(..., description="Reviewer name or employee identity")
+    notes: Optional[str] = Field("", description="Audit notes explaining disposition rationale")
+    investigation_id: Optional[int] = Field(None, description="Optional associated agent investigation ID")
 
 
 @app.get("/")
 def root():
+    has_token = bool(os.environ.get("PAISAGUARD_API_TOKEN", PAISAGUARD_API_TOKEN))
+    has_secret = bool(os.environ.get("RAZORPAY_WEBHOOK_SECRET", RAZORPAY_WEBHOOK_SECRET))
     return {
         "system": "PaisaGuard FinOps Engine",
         "status": "operational",
+        "version": "3.0.0",
         "environment": ENVIRONMENT,
-        "wal_mode": True,
-        "hmac_verification": True,
-        "hmac_policy": "enforced" if (ENVIRONMENT != "development" or PAISAGUARD_REQUIRE_HMAC) else "development_bypass_allowed",
-        "policy_gatekeeper": "active"
+        "canonical_currency": "integer_paise",
+        "security_policy": {
+            "token_configured": has_token,
+            "hmac_secret_configured": has_secret,
+            "demo_unsigned_allowed": PAISAGUARD_DEMO_ALLOW_UNSIGNED
+        }
     }
 
 
@@ -201,204 +191,433 @@ async def ingest_webhook(
 ):
     """
     Production-grade webhook ingestion:
-    1. Enforces client-IP rate limiting (120 req/min).
-    2. Enforces mandatory HMAC-SHA256 signatures in production/staging (or when PAISAGUARD_REQUIRE_HMAC=1).
-    3. Reads raw byte buffer to guarantee bit-for-bit HMAC SHA256 integrity before parsing.
-    4. Supports both Base64 and Hex-encoded HMAC digests for universal payment gateway compatibility.
-    5. Ingests using arbitrary-precision Decimal types to eliminate binary float drift.
-    6. Enforces atomic relational UPSERT on payment_id to physically eliminate race conditions.
+    1. Client-IP rate limiting.
+    2. Mandatory HMAC-SHA256 signature verification (unless demo bypass flag is active).
+    3. Idempotent deduplication by event_id in webhook_events.
+    4. Canonical integer paise insertion.
     """
-    # 1. Rate Limiting Check
     client_ip = request.client.host if request.client else "127.0.0.1"
     allowed, _ = rate_limiter.is_allowed(client_ip)
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded: Maximum 120 requests per minute. Please throttle."
+            detail="Rate limit exceeded: 200 requests/min ceiling."
         )
 
     raw_body = await request.body()
+    webhook_secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET", RAZORPAY_WEBHOOK_SECRET)
 
-    # 2. Mandatory HMAC Verification Policy
+    # HMAC Signature Policy
     if not x_razorpay_signature:
-        if ENVIRONMENT != "development" or PAISAGUARD_REQUIRE_HMAC:
-            logger.error('{"event":"hmac_rejected","reason":"missing_signature_header","env":"%s"}' % ENVIRONMENT)
+        if not PAISAGUARD_DEMO_ALLOW_UNSIGNED:
+            logger.error('{"event":"hmac_rejected","reason":"missing_signature"}')
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Security policy violation: Missing X-Razorpay-Signature header. HMAC signature is strictly required in production/staging environments."
+                detail="Security Violation: Missing X-Razorpay-Signature header. Unsigned webhooks are rejected by default."
             )
         else:
-            logger.warning('{"event":"hmac_warning","reason":"unsigned_payload_dev_bypass","env":"development"}')
+            logger.warning('{"event":"hmac_notice","reason":"unsigned_payload_permitted_under_demo_flag"}')
     else:
-        verified, encoding = verify_webhook_signature(raw_body, x_razorpay_signature, RAZORPAY_WEBHOOK_SECRET)
+        if not webhook_secret:
+            logger.error('{"event":"hmac_rejected","reason":"server_webhook_secret_missing"}')
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="FinOps Security Policy: RAZORPAY_WEBHOOK_SECRET is not configured on server."
+            )
+        verified, _ = verify_webhook_signature(raw_body, x_razorpay_signature, webhook_secret)
         if not verified:
+            logger.error('{"event":"hmac_rejected","reason":"invalid_signature"}')
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="HMAC signature verification failed: Payload corrupted or unauthorized origin."
+                detail="HMAC verification failed: Signature does not match payload content."
             )
 
+    # Parse and Validate Payload
     try:
         body_json = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-        if "payload" in body_json and isinstance(body_json["payload"], dict) and "payment" in body_json["payload"]:
+        
+        # Support native Razorpay nested entity structure or flat payload
+        if "payload" in body_json and "payment" in body_json["payload"]:
             entity = body_json["payload"]["payment"].get("entity", {})
-            amt = entity.get("amount", 0.0)
-            # In Razorpay native payload, amount is in paise (integer) if > 1000 and has no decimals
-            if isinstance(amt, int) and amt > 1000:
-                amt_dec = to_decimal(amt) / Decimal("100")
-            else:
-                amt_dec = to_decimal(amt)
-
-            fee_raw = entity.get("fee", 0.0)
-            if isinstance(fee_raw, int) and fee_raw > 100:
-                fee_dec = to_decimal(fee_raw) / Decimal("100")
-            else:
-                fee_dec = to_decimal(fee_raw)
-
-            tax_raw = entity.get("tax", 0.0)
-            if isinstance(tax_raw, int) and tax_raw > 100:
-                tax_dec = to_decimal(tax_raw) / Decimal("100")
-            else:
-                tax_dec = to_decimal(tax_raw)
-
-            payload = WebhookPayload(
+            event_id = x_razorpay_event_id or body_json.get("event_id") or f"evt_{entity.get('id')}"
+            payload = RazorpayWebhookPayload(
+                event_id=event_id,
                 event=body_json.get("event", "payment.captured"),
-                payment_id=entity.get("id", "pay_unknown"),
+                payment_id=entity.get("id"),
                 order_id=entity.get("order_id"),
-                amount=round_curr(amt_dec),
-                fee=round_curr(fee_dec),
-                tax=round_curr(tax_dec),
+                payout_id=entity.get("payout_id"),
+                amount_paise=require_paise(int(entity.get("amount", 0))),
+                fee_paise=require_paise(int(entity.get("fee", 0))),
+                tax_paise=require_paise(int(entity.get("tax", 0))),
                 payment_method=entity.get("method", "upi")
             )
         else:
-            payload = WebhookPayload(**body_json)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid webhook JSON structure: {e}")
+            if x_razorpay_event_id and "event_id" not in body_json:
+                body_json["event_id"] = x_razorpay_event_id
+            payload = RazorpayWebhookPayload(**body_json)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid webhook JSON structure: {exc}")
 
-    # Defensive normalization of currency amounts using Decimal (handling None/missing values safely)
-    amount_dec = to_decimal(payload.amount)
-    fee_dec = to_decimal(payload.fee)
-    tax_dec = to_decimal(payload.tax)
-    net_dec = round_curr(amount_dec - (fee_dec + tax_dec))
+    # Compute source payload hash
+    source_payload_hash = f"sha256:{hashlib.sha256(raw_body).hexdigest()}"
+    net_paise = payload.amount_paise - (payload.fee_paise + payload.tax_paise)
+    now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    amount_val = float(round_curr(amount_dec))
-    fee_val = float(round_curr(fee_dec))
-    tax_val = float(round_curr(tax_dec))
-    net_amt = float(net_dec)
-    method_val = payload.payment_method or "upi"
-    
-    with get_db_cursor(DEFAULT_DB_PATH) as cursor:
+    with get_db_cursor() as cursor:
+        # Deduplication Check
+        cursor.execute("SELECT event_id FROM webhook_events WHERE event_id = ?", (payload.event_id,))
+        if cursor.fetchone():
+            logger.info('{"event":"webhook_duplicate_ignored","event_id":"%s"}' % payload.event_id)
+            return {
+                "status": "duplicate_ignored",
+                "event_id": payload.event_id,
+                "payment_id": payload.payment_id,
+                "message": "Event ID already recorded; deduplicated without state mutation."
+            }
+
+        # Record in webhook_events
+        cursor.execute("""
+            INSERT INTO webhook_events (
+                event_id, payment_id, source_payload_hash, payload_json, hmac_signature, received_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, 'processed');
+        """, (
+            payload.event_id,
+            payload.payment_id,
+            source_payload_hash,
+            json.dumps(payload.model_dump()),
+            x_razorpay_signature or "none",
+            now_ts
+        ))
+
+        # Atomic Upsert into razorpay_settlements
         cursor.execute("""
             INSERT INTO razorpay_settlements (
-                payment_id, settlement_id, order_id, amount, fee, tax, net_amount,
-                currency, payment_method, settled_at, status
-            ) VALUES (?, 'setl_live_stream', ?, ?, ?, ?, ?, 'INR', ?, datetime('now'), 'settled')
+                payment_id, business_tx_id, order_id, payout_id, amount_paise,
+                fee_paise, tax_paise, net_paise, currency, payment_method,
+                source_payload_hash, settled_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INR', ?, ?, ?, 'settled')
             ON CONFLICT(payment_id) DO UPDATE SET
                 order_id = excluded.order_id,
-                amount = excluded.amount,
-                fee = excluded.fee,
-                tax = excluded.tax,
-                net_amount = excluded.net_amount,
+                payout_id = excluded.payout_id,
+                amount_paise = excluded.amount_paise,
+                fee_paise = excluded.fee_paise,
+                tax_paise = excluded.tax_paise,
+                net_paise = excluded.net_paise,
                 status = excluded.status;
         """, (
             payload.payment_id,
+            f"tx_live_{payload.payment_id}",
             payload.order_id,
-            amount_val,
-            fee_val,
-            tax_val,
-            net_amt,
-            method_val
+            payload.payout_id,
+            payload.amount_paise,
+            payload.fee_paise,
+            payload.tax_paise,
+            net_paise,
+            payload.payment_method or "upi",
+            source_payload_hash,
+            now_ts
         ))
 
-    logger.info(json.dumps({
-        "event": "webhook_ingested",
-        "payment_id": payload.payment_id,
-        "order_id": payload.order_id,
-        "amount": amount_val,
-        "fee": fee_val,
-        "tax": tax_val,
-        "net_amount": net_amt,
-        "hmac_verified": bool(x_razorpay_signature)
-    }))
-        
+    logger.info('{"event":"webhook_ingested","event_id":"%s","payment_id":"%s","amount_paise":%d}' % (
+        payload.event_id, payload.payment_id, payload.amount_paise
+    ))
+
     return {
-        "status": "success",
+        "status": "ingested",
+        "event_id": payload.event_id,
         "payment_id": payload.payment_id,
-        "action": "upserted",
+        "amount_paise": payload.amount_paise,
         "hmac_verified": bool(x_razorpay_signature)
     }
 
 
-@app.post("/ai/diagnose", response_model=AIDiagnosticResponse)
-def diagnose_discrepancy(req: AIDiagnosticRequest):
-    """
-    AI Diagnostic Boundary:
-    The LLM/heuristic acts strictly as a read-only classifier returning structured metadata.
-    The Deterministic Policy Gatekeeper validates economic risk before any state mutation can occur.
-    """
-    fee_diff = req.actual_fee - req.expected_fee
-    
-    # Read-only diagnostic classification
-    if "corporate" in req.order_id.lower() or abs(fee_diff - (req.gross_amount * Decimal("0.005"))) < Decimal("1.0"):
-        classification = "CORPORATE_CARD_INTERCHANGE_SURCHARGE"
-        confidence = 0.96
-        suggested_action = "APPROVE_CORPORATE_CARD_CHARGE"
-    else:
-        classification = "UNKNOWN_PRICING_DEVIATION"
-        confidence = 0.65
-        suggested_action = "REQUIRE_HUMAN_AUDIT"
-
-    # Deterministic Policy Gatekeeper Evaluation
-    policy_approved, policy_reason = PolicyGatekeeper.evaluate(
-        gross_amount=req.gross_amount,
-        actual_fee=req.actual_fee,
-        expected_fee=req.expected_fee,
-        suggested_action=suggested_action
-    )
-
-    return AIDiagnosticResponse(
-        order_id=req.order_id,
-        classification=classification,
-        confidence=confidence,
-        suggested_action=suggested_action,
-        policy_approved=policy_approved,
-        policy_reason=policy_reason
-    )
-
-
-@app.post("/reconcile/sweep", dependencies=[Depends(verify_admin_token)])
-def trigger_sweep():
+# Protected State-Changing FinOps Endpoints
+@app.post("/reconcile/sweep", dependencies=[Depends(verify_api_token)])
+def trigger_reconciliation_sweep():
+    """Triggers the deterministic 3-source reconciliation pipeline."""
     try:
-        summary = execute_reconciliation_pipeline(DEFAULT_DB_PATH)
+        summary = execute_reconciliation_pipeline()
         return {"status": "completed", "summary": summary}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error(f"Reconciliation sweep failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/ai/investigate", dependencies=[Depends(verify_api_token)])
+def trigger_ai_investigation(req: AIInvestigateRequest):
+    """Invokes AI exception investigation agent on an unresolved decision."""
+    try:
+        result = investigate_exception(decision_id=req.decision_id)
+        return {"status": "investigated", "result": result}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"AI investigation error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/approvals/decision", dependencies=[Depends(verify_api_token)])
+def submit_human_approval(req: HumanApprovalRequest):
+    """Records an append-only human FinOps approval or rejection."""
+    try:
+        approval_id = record_human_approval(
+            decision_id=req.decision_id,
+            action=req.action,
+            reviewer=req.reviewer,
+            notes=req.notes,
+            investigation_id=req.investigation_id
+        )
+        return {
+            "status": "approval_recorded",
+            "approval_id": approval_id,
+            "decision_id": req.decision_id,
+            "action": req.action,
+            "reviewer": req.reviewer
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Human approval error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# Read Endpoints for Isolated Dashboard (Zero SQLite access required)
 @app.get("/metrics")
 def get_metrics():
-    conn = get_db_connection(DEFAULT_DB_PATH)
+    """Separated transaction-level and payout-level metrics."""
+    conn = get_db_connection()
     try:
-        total_settle = conn.execute("SELECT COUNT(*) FROM razorpay_settlements").fetchone()[0]
         total_oms = conn.execute("SELECT COUNT(*) FROM oms_orders").fetchone()[0]
-        matched_count = conn.execute(
-            "SELECT COUNT(*) FROM reconciliation_ledger WHERE reconciled_status IN ('MATCHED', 'RULE_OVERRIDDEN')"
+        total_settle = conn.execute("SELECT COUNT(*) FROM razorpay_settlements").fetchone()[0]
+        total_bank_cr = conn.execute("SELECT COUNT(*) FROM bank_payout_credits").fetchone()[0]
+
+        total_volume_paise = conn.execute("SELECT COALESCE(SUM(amount_paise), 0) FROM razorpay_settlements").fetchone()[0]
+
+        # Decisions from projection view
+        matched_tx = conn.execute(
+            "SELECT COUNT(*) FROM v_current_decisions WHERE subject_type = 'BUSINESS_TX' AND match_status IN ('MATCHED', 'RULE_OVERRIDDEN')"
         ).fetchone()[0]
-        exception_count = conn.execute(
-            "SELECT COUNT(*) FROM reconciliation_ledger WHERE reconciled_status = 'EXCEPTION'"
+        exception_tx = conn.execute(
+            "SELECT COUNT(*) FROM v_current_decisions WHERE subject_type = 'BUSINESS_TX' AND match_status = 'EXCEPTION'"
         ).fetchone()[0]
-        rules_count = conn.execute("SELECT COUNT(*) FROM resolved_rules").fetchone()[0]
-        match_rate = round((matched_count / total_settle) * 100, 2) if total_settle > 0 else 0.0
-        
+
+        matched_payouts = conn.execute(
+            "SELECT COUNT(*) FROM v_current_decisions WHERE subject_type = 'PAYOUT' AND match_status = 'MATCHED'"
+        ).fetchone()[0]
+        exception_payouts = conn.execute(
+            "SELECT COUNT(*) FROM v_current_decisions WHERE subject_type IN ('PAYOUT', 'BANK_CREDIT') AND match_status = 'EXCEPTION'"
+        ).fetchone()[0]
+
+        unresolved_count = conn.execute(
+            "SELECT COUNT(*) FROM v_current_decisions WHERE current_disposition = 'UNRESOLVED' AND match_status = 'EXCEPTION'"
+        ).fetchone()[0]
+        approved_count = conn.execute(
+            "SELECT COUNT(*) FROM human_approvals"
+        ).fetchone()[0]
+
+        total_tx = matched_tx + exception_tx
+        total_p = matched_payouts + exception_payouts
+
         return {
-            "total_oms_orders": total_oms,
-            "total_settlements": total_settle,
-            "matched_transactions": matched_count,
-            "exception_count": exception_count,
-            "match_rate": match_rate,
-            "active_rules": rules_count
+            "counts": {
+                "oms_orders": total_oms,
+                "settlements": total_settle,
+                "bank_credits": total_bank_cr,
+                "total_volume_paise": total_volume_paise,
+                "total_volume_inr": format_paise_inr(total_volume_paise)
+            },
+            "transaction_metrics": {
+                "total_transactions": total_tx,
+                "matched_count": matched_tx,
+                "exception_count": exception_tx,
+                "match_rate_percent": round((matched_tx / total_tx) * 100, 2) if total_tx > 0 else 0.0,
+                "unresolved_count": unresolved_count
+            },
+            "payout_metrics": {
+                "total_payout_batches": total_p,
+                "matched_count": matched_payouts,
+                "exception_count": exception_payouts,
+                "match_rate_percent": round((matched_payouts / total_p) * 100, 2) if total_p > 0 else 0.0
+            },
+            "governance": {
+                "unresolved_exceptions": unresolved_count,
+                "human_approvals_recorded": approved_count
+            }
         }
     finally:
         conn.close()
+
+
+@app.get("/payouts")
+def get_payouts():
+    """Payout batch aggregation joined to bank credits."""
+    conn = get_db_connection()
+    try:
+        payout_rows = conn.execute("""
+            SELECT 
+                s.payout_id,
+                COUNT(s.payment_id) as settlement_count,
+                SUM(s.amount_paise) as gross_paise,
+                SUM(s.fee_paise) as fee_paise,
+                SUM(s.tax_paise) as tax_paise,
+                SUM(s.net_paise) as net_paise,
+                b.credit_id,
+                b.utr_number,
+                b.credit_amount_paise,
+                b.status as bank_status
+            FROM razorpay_settlements s
+            LEFT JOIN bank_payout_credits b ON s.payout_id = b.payout_id
+            WHERE s.payout_id IS NOT NULL
+            GROUP BY s.payout_id
+            ORDER BY s.payout_id ASC;
+        """).fetchall()
+
+        # Unmatched bank credits (direct credits with no payout_id)
+        direct_credits = conn.execute("""
+            SELECT credit_id, utr_number, credit_amount_paise, credited_at, account_tail, status
+            FROM bank_payout_credits
+            WHERE payout_id IS NULL OR payout_id NOT IN (SELECT DISTINCT payout_id FROM razorpay_settlements WHERE payout_id IS NOT NULL);
+        """).fetchall()
+
+        payouts_data = []
+        for r in payout_rows:
+            net_p = r["net_paise"] or 0
+            bank_p = r["credit_amount_paise"]
+            if bank_p is None:
+                status_label = "CREDIT_DELAYED"
+            elif bank_p == net_p:
+                status_label = "RECONCILED"
+            else:
+                status_label = "BANK_MISMATCH"
+
+            payouts_data.append({
+                "payout_id": r["payout_id"],
+                "settlement_count": r["settlement_count"],
+                "gross_paise": r["gross_paise"],
+                "net_paise": net_p,
+                "net_inr": format_paise_inr(net_p),
+                "credit_id": r["credit_id"],
+                "utr_number": r["utr_number"],
+                "bank_amount_paise": bank_p,
+                "bank_amount_inr": format_paise_inr(bank_p) if bank_p is not None else "Pending",
+                "status": status_label
+            })
+
+        direct_data = []
+        for d in direct_credits:
+            direct_data.append({
+                "credit_id": d["credit_id"],
+                "utr_number": d["utr_number"],
+                "credit_amount_paise": d["credit_amount_paise"],
+                "credit_amount_inr": format_paise_inr(d["credit_amount_paise"]),
+                "credited_at": d["credited_at"],
+                "status": "UNMATCHED_DIRECT_CREDIT"
+            })
+
+        return {"payout_batches": payouts_data, "unmatched_bank_credits": direct_data}
+    finally:
+        conn.close()
+
+
+@app.get("/exceptions")
+def get_exceptions():
+    """Unresolved exception queue with minimized evidence bundles."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("""
+            SELECT 
+                d.decision_id,
+                d.subject_type,
+                d.subject_id,
+                d.business_tx_id,
+                d.order_id,
+                d.payment_id,
+                d.payout_id,
+                d.credit_id,
+                d.discrepancy_code,
+                d.variance_paise,
+                d.evidence_json,
+                d.current_disposition,
+                d.decision_created_at
+            FROM v_current_decisions d
+            WHERE d.match_status = 'EXCEPTION'
+            ORDER BY d.decision_id ASC;
+        """).fetchall()
+
+        exceptions_list = []
+        for r in rows:
+            exceptions_list.append({
+                "decision_id": r["decision_id"],
+                "subject_type": r["subject_type"],
+                "subject_id": r["subject_id"],
+                "business_tx_id": r["business_tx_id"],
+                "order_id": r["order_id"],
+                "payment_id": r["payment_id"],
+                "payout_id": r["payout_id"],
+                "credit_id": r["credit_id"],
+                "discrepancy_code": r["discrepancy_code"],
+                "variance_paise": r["variance_paise"],
+                "variance_inr": format_paise_inr(r["variance_paise"]),
+                "evidence": json.loads(r["evidence_json"]) if r["evidence_json"] else {},
+                "current_disposition": r["current_disposition"],
+                "created_at": r["decision_created_at"]
+            })
+
+        return {"exceptions": exceptions_list, "total_count": len(exceptions_list)}
+    finally:
+        conn.close()
+
+
+@app.get("/audit-events")
+def get_audit_events():
+    """Append-only audit timeline."""
+    conn = get_db_connection()
+    try:
+        events = conn.execute("""
+            SELECT audit_id, event_type, aggregate_type, aggregate_id, payload_json, created_at
+            FROM audit_events
+            ORDER BY audit_id DESC
+            LIMIT 100;
+        """).fetchall()
+
+        approvals = conn.execute("""
+            SELECT approval_id, decision_id, action, reviewer, notes, created_at
+            FROM human_approvals
+            ORDER BY approval_id DESC
+            LIMIT 100;
+        """).fetchall()
+
+        investigations = conn.execute("""
+            SELECT investigation_id, decision_id, root_cause, confidence, proposed_action,
+                   should_abstain, policy_status, created_at
+            FROM agent_investigations
+            ORDER BY investigation_id DESC
+            LIMIT 100;
+        """).fetchall()
+
+        return {
+            "audit_events": [dict(e) for e in events],
+            "human_approvals": [dict(a) for a in approvals],
+            "agent_investigations": [dict(i) for i in investigations]
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/evaluation-report")
+def get_evaluation_report():
+    """Returns the latest benchmark evaluation report from out/evaluation-report.json."""
+    report_file = OUT_DIR / "evaluation-report.json"
+    if not report_file.exists():
+        return {
+            "status": "not_generated",
+            "message": "Evaluation report has not been generated yet. Run 'python eval_benchmarks.py' to generate."
+        }
+    try:
+        with open(report_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read evaluation report: {exc}")
 
 
 @app.get("/metrics/prometheus")
@@ -406,40 +625,23 @@ def get_prometheus_metrics():
     """Prometheus-compatible plain text metrics exposition."""
     m = get_metrics()
     lines = [
-        "# HELP paisaguard_oms_orders_total Total number of internal OMS orders",
+        "# HELP paisaguard_oms_orders_total Total internal OMS orders",
         "# TYPE paisaguard_oms_orders_total counter",
-        f"paisaguard_oms_orders_total {m['total_oms_orders']}",
+        f"paisaguard_oms_orders_total {m['counts']['oms_orders']}",
         "# HELP paisaguard_settlements_total Total gateway settlements ingested",
         "# TYPE paisaguard_settlements_total counter",
-        f"paisaguard_settlements_total {m['total_settlements']}",
-        "# HELP paisaguard_matched_transactions_total Total verified and matched transactions",
-        "# TYPE paisaguard_matched_transactions_total counter",
-        f"paisaguard_matched_transactions_total {m['matched_transactions']}",
-        "# HELP paisaguard_exceptions_total Current exceptions pending in queue",
-        "# TYPE paisaguard_exceptions_total gauge",
-        f"paisaguard_exceptions_total {m['exception_count']}",
-        "# HELP paisaguard_match_rate_percent Current reconciliation match percentage",
-        "# TYPE paisaguard_match_rate_percent gauge",
-        f"paisaguard_match_rate_percent {m['match_rate']}",
-        "# HELP paisaguard_active_rules Total precomputed override rules active",
-        "# TYPE paisaguard_active_rules gauge",
-        f"paisaguard_active_rules {m['active_rules']}"
+        f"paisaguard_settlements_total {m['counts']['settlements']}",
+        "# HELP paisaguard_bank_credits_total Total bank payout credits received",
+        "# TYPE paisaguard_bank_credits_total counter",
+        f"paisaguard_bank_credits_total {m['counts']['bank_credits']}",
+        "# HELP paisaguard_tx_match_rate_percent Transaction reconciliation match percentage",
+        "# TYPE paisaguard_tx_match_rate_percent gauge",
+        f"paisaguard_tx_match_rate_percent {m['transaction_metrics']['match_rate_percent']}",
+        "# HELP paisaguard_payout_match_rate_percent Payout batch match percentage",
+        "# TYPE paisaguard_payout_match_rate_percent gauge",
+        f"paisaguard_payout_match_rate_percent {m['payout_metrics']['match_rate_percent']}",
+        "# HELP paisaguard_unresolved_exceptions Unresolved exceptions pending in queue",
+        "# TYPE paisaguard_unresolved_exceptions gauge",
+        f"paisaguard_unresolved_exceptions {m['governance']['unresolved_exceptions']}"
     ]
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")
-
-
-@app.post("/rules/resolve", dependencies=[Depends(verify_admin_token)])
-def add_resolution_rule(req: RuleOverrideRequest):
-    with get_db_cursor(DEFAULT_DB_PATH) as cursor:
-        cursor.execute("""
-            INSERT OR REPLACE INTO resolved_rules (
-                rule_id, pattern_key, action, exception_code, description, created_at
-            ) VALUES (?, ?, ?, ?, ?, datetime('now'));
-        """, (
-            req.rule_id,
-            req.pattern_key,
-            req.action,
-            req.exception_code,
-            req.description
-        ))
-    return {"status": "rule_applied", "rule_id": req.rule_id}
