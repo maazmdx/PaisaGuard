@@ -11,28 +11,90 @@ PaisaGuard reconciles an internal Order Management System (OMS), payment gateway
 
 ---
 
-## Key Features & Architecture
+## Architecture & Data Flow
 
+```mermaid
+flowchart TD
+    subgraph SOURCELAYER["1. Multi-Source Financial Ingestion"]
+        OMS["Internal OMS Orders (CSV/DB)"]
+        RZP["Razorpay Settlement Webhooks"]
+        BNK["Bank Payout Credits (MT940/Bank Feed)"]
+    end
+
+    subgraph GATEWAY["2. Gateway & Ingestion Security"]
+        HMAC{"HMAC-SHA256 Verification (Hex & Base64)"}
+        DEDUP["Idempotent Deduplication (event_id)"]
+        PAISE["Canonical Integer Paise Converter (*_paise)"]
+    end
+
+    RZP --> HMAC
+    HMAC -->|Valid Signature| DEDUP
+    HMAC -->|Invalid / Tampered| REJ["HTTP 401 Unauthorized"]
+    DEDUP --> PAISE
+    OMS --> PAISE
+    BNK --> PAISE
+
+    subgraph ENGINE["3. Deterministic 3-Way Reconciliation Engine"]
+        P1["Pass 1: Transaction Matching (Order ID, Payment ID, Gross Paise)"]
+        P2["Pass 2: Payout Batch Matching (Payout ID, Sum Net Paise, Bank UTR)"]
+        P3["Pass 3: Scoped Rules (Pre-Approved Fee Overrides)"]
+        P4["Pass 4: Snapshot Fingerprinting (Deterministic Hashing)"]
+    end
+
+    PAISE --> P1
+    P1 --> P2
+    P2 --> P3
+    P3 --> P4
+
+    subgraph STORAGE["4. Immutable Financial Storage (SQLite WAL)"]
+        LEDGER[("reconciliation_ledger (Canonical Paise)")]
+        DECISIONS[("reconciliation_decisions (Exceptions Queue)")]
+        AUDIT[("audit_events & human_approvals (Append-Only)")]
+        VIEW{{"v_current_decisions (Dynamic Projection View)"}}
+    end
+
+    P4 -->|Proved Matches| LEDGER
+    P4 -->|Unresolved Discrepancies| DECISIONS
+
+    subgraph AIAGENT["5. Guarded AI Exception Investigation Agent"]
+        ISOLATE["Label Isolation & Minimized Evidence Filter"]
+        LLM["AI Provider: Groq (Llama-3.3/Compound) / Gemini 2.5"]
+        VALID["Pydantic Response Validator & Citation Checker"]
+    end
+
+    DECISIONS --> ISOLATE
+    ISOLATE -->|Raw Factual Numbers Only| LLM
+    LLM --> VALID
+
+    subgraph GATE["6. Deterministic Policy Safety Gate"]
+        POL{"Policy Gate: Variance Ceiling, MDR Cap, Action Whitelist"}
+        ABSTAIN["Audited Forced Abstention (confidence < 0.70 / violation)"]
+    end
+
+    VALID --> POL
+    POL -->|Safe Recommendation| REVIEW["Human FinOps Operator (Review & Sign-Off)"]
+    POL -->|Policy Breach / Unknown Action| ABSTAIN
+    ABSTAIN --> REVIEW
+
+    subgraph HUMAN["7. Human Approval & Audit Preservation"]
+        DECIDE{"Operator Decision: APPROVE / REJECT / ESCALATE"}
+    end
+
+    REVIEW --> DECIDE
+    DECIDE -->|Zero UPDATEs: INSERT Only| AUDIT
+    DECISIONS -.-> VIEW
+    AUDIT -.-> VIEW
+
+    subgraph UI["8. Decoupled Presentation Layer"]
+        API["FastAPI FinOps Controller (:8001)"]
+        DASH["Streamlit Visual Console (:8501)"]
+    end
+
+    VIEW --> API
+    API --> DASH
 ```
-[ Internal OMS Orders ] <---+
-                            |---> [ Deterministic 3-Way Matcher ] ---> [ Auto-Matched Ledger ]
-[ Razorpay Settlements ] <--+               (Canonical Paise)
-                            |                      |
-[ Bank Payout Credits ] <---+                      v (Unresolved Anomalies)
-                                           [ Exception Queue ]
-                                                   |
-                                                   v (Factual Evidence Only)
-                                      [ Guarded AI Agent (Groq / Gemini) ]
-                                                   |
-                                                   v (Citations + Confidence)
-                                      [ Hardened Policy Safety Gate ]
-                                                   |
-                                                   v
-                                      [ Human FinOps Approval / Override ]
-                                                   |
-                                                   v
-                                      [ Append-Only Audit Trail (Zero UPDATEs) ]
-```
+
+### Core Architectural Pillars
 
 | Architectural Pillar | Implementation Details |
 | :--- | :--- |
@@ -131,20 +193,6 @@ Verify AI connectivity without exposing your secret API key:
 curl http://localhost:8001/ai/preflight
 ```
 
----
-
-## 5-Minute Evaluator Demo Flow
-
-1. Open **Streamlit Visual Console** at `http://localhost:8501`.
-2. **Batch KPI Board**: Inspect the 88.0% transaction match rate, fee leakages, and payout totals.
-3. **Payout Batches**: View settlements reconciled against bank UTR references and delayed payouts.
-4. **Exceptions & AI Investigator**:
-   - Open an unresolved exception (e.g. fee variance or delayed payout).
-   - Click **Run AI Investigation** to trigger real-time diagnosis.
-   - Verify the provider badge (`⚡ GROQ LIVE` or `🤖 GEMINI LIVE`), confidence score, citations, and policy gate approval.
-   - Click **Approve Resolution** as a named reviewer.
-5. **Audit & Approvals Log**: Review the append-only timeline showing the immutable audit record.
-6. **API Docs**: Explore interactive Swagger documentation at `http://localhost:8001/docs`.
 
 ---
 
