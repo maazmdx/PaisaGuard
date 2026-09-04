@@ -1,54 +1,54 @@
 """
-db.py — Database connection management & concurrency configuration.
+db.py — Database connection management & concurrency configuration for PaisaGuard.
 
-Default Engine: SQLite in WAL (Write-Ahead-Logging) mode with synchronous=NORMAL.
-Provides lock-free concurrent reads and atomic relational upserts.
-
-Enterprise Scaling Note:
-For distributed multi-region horizontal scaling exceeding single-node write capacity
-(>200-300 writes/sec), configure DATABASE_URL or POSTGRES_DSN to route traffic
-through PostgreSQL with partitioned settlement tables.
+Engine: SQLite in WAL (Write-Ahead-Logging) mode with synchronous=NORMAL.
+Provides high-throughput concurrent reads and transactional writes.
 """
 
-import sqlite3
 import os
+import json
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, Any, Union, Optional
 from contextlib import contextmanager
 
-# Default database path in PaisaGuard workspace
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = BASE_DIR / "reconciliation.db"
+DEFAULT_DB_PATH = Path(os.environ.get("PAISAGUARD_DB_PATH", str(BASE_DIR / "reconciliation.db")))
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 
-DATABASE_URL = os.environ.get("DATABASE_URL", os.environ.get("POSTGRES_DSN", ""))
+
+def get_db_path() -> Path:
+    """Returns the configured database path, resolving from environment if present."""
+    return Path(os.environ.get("PAISAGUARD_DB_PATH", str(DEFAULT_DB_PATH)))
 
 
-def get_db_connection(db_path: str | Path = DEFAULT_DB_PATH, use_wal: bool = True) -> sqlite3.Connection:
+def get_db_connection(db_path: Optional[Union[str, Path]] = None, use_wal: bool = True) -> sqlite3.Connection:
     """
-    Returns an SQLite connection configured for high-concurrency WAL mode.
-    Configured with busy_timeout=5000ms to eliminate locked-database contention.
+    Returns an SQLite connection configured for WAL mode and foreign key enforcement.
     """
-    conn = sqlite3.connect(str(db_path), timeout=10.0, check_same_thread=False)
+    target_path = Path(db_path) if db_path else get_db_path()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(target_path), timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    
+
     if use_wal:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
     else:
         conn.execute("PRAGMA journal_mode=DELETE;")
-        
+
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
 @contextmanager
-def get_db_cursor(db_path: str | Path = DEFAULT_DB_PATH, use_wal: bool = True, auto_commit: bool = True):
+def get_db_cursor(db_path: Optional[Union[str, Path]] = None, use_wal: bool = True, auto_commit: bool = True):
     """
-    Managed context yielding a database cursor with automatic commit/rollback.
-    Transaction Boundary Control:
-      - auto_commit=True (default): Commits on block exit, rollbacks on unhandled exception.
-      - auto_commit=False: Leaves commit to caller for large chunked batch operations.
+    Context manager yielding a cursor with transaction boundary control.
     """
     conn = get_db_connection(db_path, use_wal)
     cursor = conn.cursor()
@@ -64,28 +64,40 @@ def get_db_cursor(db_path: str | Path = DEFAULT_DB_PATH, use_wal: bool = True, a
         conn.close()
 
 
-def get_postgres_connection():
+def log_audit_event(
+    conn_or_path: Union[sqlite3.Connection, str, Path],
+    event_type: str,
+    aggregate_type: str,
+    aggregate_id: str,
+    payload: Dict[str, Any]
+) -> int:
     """
-    Optional PostgreSQL connection hook for enterprise horizontal scaling.
-    Active when DATABASE_URL or POSTGRES_DSN is set and psycopg2 is installed.
+    Appends an immutable audit event to audit_events table.
     """
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL / POSTGRES_DSN environment variable is not configured.")
-    try:
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        return conn
-    except ImportError:
-        raise RuntimeError("psycopg2 is required for PostgreSQL scaling mode. Install via 'pip install psycopg2-binary'.")
+    timestamp = datetime.now(timezone.utc).isoformat()
+    payload_json = json.dumps(payload, sort_keys=True)
+
+    if isinstance(conn_or_path, sqlite3.Connection):
+        cursor = conn_or_path.execute("""
+            INSERT INTO audit_events (event_type, aggregate_type, aggregate_id, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?);
+        """, (event_type, aggregate_type, aggregate_id, payload_json, timestamp))
+        return cursor.lastrowid
+    else:
+        with get_db_cursor(conn_or_path) as cursor:
+            cursor.execute("""
+                INSERT INTO audit_events (event_type, aggregate_type, aggregate_id, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?);
+            """, (event_type, aggregate_type, aggregate_id, payload_json, timestamp))
+            return cursor.lastrowid
 
 
-def init_db(db_path: str | Path = DEFAULT_DB_PATH, schema_path: str | Path = SCHEMA_PATH) -> None:
+def init_db(db_path: Optional[Union[str, Path]] = None, schema_path: Union[str, Path] = SCHEMA_PATH) -> None:
     """
-    Initializes the SQLite database with the PaisaGuard schema.
+    Initializes the SQLite database schema if not already present.
     """
     conn = get_db_connection(db_path, use_wal=True)
-    with open(schema_path, "r") as f:
+    with open(schema_path, "r", encoding="utf-8") as f:
         schema_sql = f.read()
     conn.executescript(schema_sql)
     conn.commit()
@@ -94,4 +106,4 @@ def init_db(db_path: str | Path = DEFAULT_DB_PATH, schema_path: str | Path = SCH
 
 if __name__ == "__main__":
     init_db()
-    print(f"Database initialized successfully at: {DEFAULT_DB_PATH}")
+    print(f"Database initialized successfully at: {get_db_path()}")
