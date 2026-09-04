@@ -11,12 +11,15 @@ services:
       - "8501:8501"
     environment:
       - PAISAGUARD_ENV=development
+      - PAISAGUARD_IN_CONTAINER=1
+      - PAISAGUARD_HOST=0.0.0.0
       - RAZORPAY_WEBHOOK_SECRET=rzp_sec_buildathon_2026_demo
     volumes:
       - ./out:/app/out
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/ && curl -f http://localhost:8501/ || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 15s
     restart: unless-stopped

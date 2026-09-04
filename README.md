@@ -143,7 +143,7 @@ pip install -r requirements.txt
 # 2. Seed database in WAL mode
 python seed_data.py
 
-# 3. Run all 18 automated unit and integration tests
+# 3. Run all automated unit and integration tests (30+ tests)
 pytest -v
 
 # 4. Run the multi-threaded concurrency benchmark (records machine specs & JSON artifact)
@@ -154,8 +154,19 @@ uvicorn api:app --port 8001 &
 streamlit run app.py --server.port 8501
 ```
 
+### Concurrency & Benchmark Reproducibility & Environment Provenance
+
+All reported concurrency benchmarks and tax audit ledgers are fully reproducible both locally and in automated continuous integration:
+- **CI Environment Provenance**: Every commit and pull request runs on GitHub Actions `ubuntu-latest` (Linux x86_64, 2 vCPU, 7GB RAM, Python 3.12, SQLite 3.45+).
+- **Downloadable CI Artifacts**: The CI workflow (`.github/workflows/reconcile-ci.yml`) uploads the full `out/` artifact package named `paisaguard-audit-artifacts` containing:
+  - `out/concurrency-benchmark.json`: Machine-readable latency, throughput, and zero-deadlock audit comparing WAL vs Rollback Journaling.
+  - `out/ci-benchmark-provenance.json`: Exact runner CPU core count, platform kernel, Python version, commit SHA, and timing metadata.
+  - `out/monthly-tax-audit-report.json`: Section 16(2)(aa) GSTR-2B tax audit with cryptographic `seed_hash` and `run_id` provenance.
+  - `out/final-matched-ledger.csv` & `out/final-exception-queue.csv`.
+- **Direct CI Workflow Link**: [PaisaGuard GitHub Actions Workflows](https://github.com/maazmdx/PaisaGuard/actions)
+
 ### What to Show in the Streamlit Console (`http://localhost:8501`):
-1. **Executive KPI Header**: Inspect live Settlement Match Rate (90.29%), Audited Volume, and Bounded Sub-Paise Rounding Accumulator (+0.2128 INR).
+1. **Executive KPI Header**: Inspect live Settlement Match Rate (94.0%), Audited Volume, and Bounded Sub-Paise Rounding Accumulator (+0.2164 INR).
 2. **Matched Ledger View**: Filter by status `MATCHED` or `RULE_OVERRIDDEN` with verified sub-paise drift markers.
 3. **Exception Queue & 1-Click Rule Override**: Select an unresolved fee discrepancy, review the AI Diagnostic recommendation, and click *"1-Click Override"*. Watch the record instantly transition to `RULE_OVERRIDDEN` in < 0.2ms.
 4. **Live Webhook Replay**: Click *"⚡ Live Replay Webhooks"* in the sidebar to simulate live incoming signed webhook events with real-time audit sweeps.
@@ -172,21 +183,24 @@ PaisaGuard/
 ├── api.py                    # FastAPI gateway for idempotent webhook ingestion & Prometheus metrics
 ├── app.py                    # Streamlit visual operator console with live replay trigger
 ├── db.py                     # SQLite connection helper & WAL setup
-├── schema.sql                # SQL database initialization schema with runs audit table
-├── recon_engine.py           # Core 4-Pass matching engine with persistent accumulator
+├── money.py                  # Centralized Decimal precision, commercial rounding & paise math helpers
+├── schema.sql                # SQL database initialization schema with runs audit table & seed_hash
+├── recon_engine.py           # Core 4-Pass matching engine with persistent accumulator & seed_hash
 ├── seed_data.py              # Synthesizes 100+ transaction rows with real-world anomalies
 ├── concurrency_tester.py     # Parallel write stress test utility emitting JSON benchmark report
 ├── replay_webhooks.py        # Standalone live webhook replayer testing Hex/Base64 HMAC
+├── test_hmac.py              # Pure HMAC unit tests (Hex, Base64, prefixes, tampering, whitespace)
+├── test_money.py             # Monetary precision unit tests (half-up rounding, paise roundtrip)
 ├── test_reconciliation.py    # Deterministic unit tests validating math, WAL locks & tax audit
-├── test_paisa_guard.py       # Full 18-test Pytest harness covering APIs, HMAC & gatekeeper
-├── run_demo.sh               # One-click execution shell script
+├── test_paisa_guard.py       # Full Pytest harness covering APIs, HMAC, gatekeeper & provenance
+├── run_demo.sh               # One-click execution shell script with health check wait loops
 ├── Dockerfile                # Production container specification
-├── docker-compose.yml        # Multi-service container orchestration
+├── docker-compose.yml        # Multi-service container orchestration with health checks
 ├── .github/
 │   └── workflows/
 │       └── reconcile-ci.yml  # Automated GitHub Actions test runner & artifact uploader
 ├── requirements.txt          # Clean PyPI package dependencies (zero local wheels)
-├── monthly-tax-audit-report.json # GSTR-2B Section 16(2)(aa) audit artifact
+├── monthly-tax-audit-report.json # GSTR-2B Section 16(2)(aa) audit artifact with run_id & seed_hash
 ├── out/                      # Output directory containing matched ledgers and benchmark JSON
 ├── LICENSE                   # OSI-approved MIT License
 ├── CONTRIBUTING.md           # Contribution and testing standards

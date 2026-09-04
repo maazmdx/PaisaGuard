@@ -1,5 +1,5 @@
 {
-  "benchmark_timestamp": "2026-09-03 23:07:03",
+  "benchmark_timestamp": "2026-09-04 10:49:17",
   "system_spec": {
     "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.39",
     "cpu_count": 8,
@@ -10,10 +10,10 @@
     "mode": "Rollback Journaling (DELETE)",
     "use_wal": false,
     "total_requests": 25,
-    "successful_commits": 17,
-    "lock_errors": 8,
-    "duration_seconds": 0.0706,
-    "throughput_tps": 353.9,
+    "successful_commits": 16,
+    "lock_errors": 9,
+    "duration_seconds": 0.0746,
+    "throughput_tps": 335.23,
     "lock_error_samples": [
       "database is locked",
       "database is locked",
@@ -26,8 +26,8 @@
     "total_requests": 25,
     "successful_commits": 25,
     "lock_errors": 0,
-    "duration_seconds": 0.0858,
-    "throughput_tps": 291.4,
+    "duration_seconds": 0.1188,
+    "throughput_tps": 210.4,
     "lock_error_samples": []
   },
   "verdict": "100% Lock-Free Concurrency Confirmed (0 Deadlocks)"

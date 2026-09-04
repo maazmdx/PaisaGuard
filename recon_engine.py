@@ -1,18 +1,33 @@
 import os
 import json
 import sqlite3
+import hashlib
 import pandas as pd
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 from db import get_db_connection, get_db_cursor, DEFAULT_DB_PATH
+from money import to_decimal, round_curr, to_paise, paise_to_rupees, calc_mdr_fee_and_tax
 
 BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = BASE_DIR / "out"
-TWO_PLACES = Decimal("0.01")
 
-def round_curr(val: Decimal) -> Decimal:
-    return val.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+def compute_dataset_seed_hash(conn: sqlite3.Connection) -> str:
+    """
+    Computes a deterministic SHA-256 fingerprint across operational inputs (OMS orders and settlements).
+    Guarantees end-to-end dataset provenance and tamper-evident auditability.
+    """
+    hasher = hashlib.sha256()
+    cursor = conn.cursor()
+    # Hash sorted OMS orders
+    for row in cursor.execute("SELECT order_id, gross_amount, customer_id, created_at FROM oms_orders ORDER BY order_id ASC"):
+        hasher.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}|".encode("utf-8"))
+    # Hash sorted Razorpay settlements
+    for row in cursor.execute("SELECT payment_id, order_id, amount, fee, tax, net_amount FROM razorpay_settlements ORDER BY payment_id ASC"):
+        hasher.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}:{row[4]}:{row[5]}|".encode("utf-8"))
+    return f"sha256:{hasher.hexdigest()[:32]}"
+
 
 def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accumulator: bool = False) -> dict:
     """
@@ -24,16 +39,63 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
     Exports:
       - out/final-matched-ledger.csv
       - out/final-exception-queue.csv
+      - out/monthly-tax-audit-report.json
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     
     conn = get_db_connection(db_path)
     
-    # 1. Load operational datasets into DataFrames
-    df_oms = pd.read_sql("SELECT * FROM oms_orders", conn)
-    df_settle = pd.read_sql("SELECT * FROM razorpay_settlements", conn)
-    df_rules = pd.read_sql("SELECT * FROM resolved_rules", conn)
-    df_gst_inv = pd.read_sql("SELECT * FROM gst_monthly_invoices", conn)
+    # Ensure reconciliation_runs schema and migration for seed_hash
+    with get_db_cursor(db_path) as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reconciliation_runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_timestamp TEXT NOT NULL,
+                git_sha TEXT DEFAULT 'local',
+                seed_hash TEXT DEFAULT 'sha256:none',
+                total_audited INTEGER NOT NULL,
+                matched_count INTEGER NOT NULL,
+                exception_count INTEGER NOT NULL,
+                match_rate REAL NOT NULL,
+                sub_paise_accumulator REAL NOT NULL,
+                gst_daily_aggregate REAL NOT NULL,
+                gst_monthly_invoice REAL NOT NULL,
+                gst_tax_leakage REAL NOT NULL,
+                status TEXT NOT NULL
+            );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_recon_runs_ts ON reconciliation_runs(run_timestamp);")
+        cursor.execute("PRAGMA table_info(reconciliation_runs);")
+        cols = [col[1] for col in cursor.fetchall()]
+        if "seed_hash" not in cols:
+            cursor.execute("ALTER TABLE reconciliation_runs ADD COLUMN seed_hash TEXT DEFAULT 'sha256:none';")
+
+    # Compute deterministic dataset seed hash
+    seed_hash = compute_dataset_seed_hash(conn)
+    git_sha = os.environ.get("GIT_SHA", os.environ.get("GITHUB_SHA", "local"))[:40]
+
+    # 1. Load operational datasets into DataFrames with strict deterministic ordering
+    df_oms = pd.read_sql("SELECT * FROM oms_orders ORDER BY order_id ASC", conn)
+    df_settle = pd.read_sql("SELECT * FROM razorpay_settlements ORDER BY payment_id ASC", conn)
+    df_rules = pd.read_sql("SELECT * FROM resolved_rules ORDER BY rule_id ASC", conn)
+    df_gst_inv = pd.read_sql("SELECT * FROM gst_monthly_invoices ORDER BY invoice_id ASC", conn)
+
+    # Read latest accumulator audit state for continuous multi-cycle reconciliation
+    if reset_accumulator:
+        rolling_sub_paise_drift = Decimal("0.0000")
+    else:
+        cursor = conn.cursor()
+        prior_run = cursor.execute(
+            "SELECT sub_paise_accumulator FROM reconciliation_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        if prior_run and prior_run[0] is not None:
+            rolling_sub_paise_drift = to_decimal(prior_run[0])
+        else:
+            ledger_drift = cursor.execute(
+                "SELECT SUM(sub_paise_drift) FROM reconciliation_ledger"
+            ).fetchone()
+            rolling_sub_paise_drift = to_decimal(ledger_drift[0]) if ledger_drift and ledger_drift[0] is not None else Decimal("0.0000")
+    
     conn.close()
 
     # Pre-index rules by exception pattern or order ID for O(1) matching
@@ -48,44 +110,15 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
     settle_by_order = {row["order_id"]: row for _, row in df_settle.iterrows() if row["order_id"]}
     oms_by_order = {row["order_id"]: row for _, row in df_oms.iterrows()}
 
-    # Ensure audit and runs schema exists
-    git_sha = os.environ.get("GIT_SHA", os.environ.get("GITHUB_SHA", "local"))[:40]
-    with get_db_cursor(db_path) as cursor:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS reconciliation_runs (
-                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_timestamp TEXT NOT NULL,
-                git_sha TEXT DEFAULT 'local',
-                total_audited INTEGER NOT NULL,
-                matched_count INTEGER NOT NULL,
-                exception_count INTEGER NOT NULL,
-                match_rate REAL NOT NULL,
-                sub_paise_accumulator REAL NOT NULL,
-                gst_daily_aggregate REAL NOT NULL,
-                gst_monthly_invoice REAL NOT NULL,
-                gst_tax_leakage REAL NOT NULL,
-                status TEXT NOT NULL
-            );
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_recon_runs_ts ON reconciliation_runs(run_timestamp);")
-        
-        # Read latest accumulator audit state for continuous multi-cycle reconciliation
-        prior_run = cursor.execute(
-            "SELECT sub_paise_accumulator FROM reconciliation_runs ORDER BY run_id DESC LIMIT 1"
-        ).fetchone() if not reset_accumulator else None
-
     # Contract parameters: Standard 2.0% MDR + 18% GST
     contract_mdr_rate = Decimal("0.020")
     gst_rate = Decimal("0.18")
-
-    # Rolling sub-paise accumulator to safely absorb cumulative fractional rounding
-    rolling_sub_paise_drift = Decimal(str(prior_run[0])) if prior_run and prior_run[0] is not None else Decimal("0.0000")
 
     recon_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # --- PASS 1 & 2: Process OMS orders against Razorpay settlements ---
     for order_id, oms_row in oms_by_order.items():
-        gross_amt = Decimal(str(oms_row["gross_amount"]))
+        gross_amt = to_decimal(oms_row["gross_amount"])
         
         if order_id not in settle_by_order:
             # Unsettled transaction
@@ -106,10 +139,10 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
 
         settle_row = settle_by_order[order_id]
         pay_id = settle_row["payment_id"]
-        settle_amt = Decimal(str(settle_row["amount"]))
-        actual_fee = Decimal(str(settle_row["fee"]))
-        actual_tax = Decimal(str(settle_row["tax"]))
-        actual_net = Decimal(str(settle_row["net_amount"]))
+        settle_amt = to_decimal(settle_row["amount"])
+        actual_fee = to_decimal(settle_row["fee"])
+        actual_tax = to_decimal(settle_row["tax"])
+        actual_net = to_decimal(settle_row["net_amount"])
 
         # Check gross amount mismatch
         amt_diff = abs(gross_amt - settle_amt)
@@ -131,13 +164,7 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
             continue
 
         # Mathematical contract validation with sub-paise accumulator
-        raw_fee = gross_amt * contract_mdr_rate
-        expected_fee = round_curr(raw_fee)
-        raw_tax = expected_fee * gst_rate
-        expected_tax = round_curr(raw_tax)
-
-        # Mathematical rounding difference
-        drift = (expected_fee + expected_tax) - (raw_fee + raw_tax)
+        expected_fee, expected_tax, _, drift = calc_mdr_fee_and_tax(gross_amt, contract_mdr_rate, gst_rate)
         rolling_sub_paise_drift += drift
 
         fee_diff = actual_fee - expected_fee
@@ -214,7 +241,7 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
         s_ord_id = settle_row["order_id"]
         if not s_ord_id or s_ord_id not in oms_by_order:
             pay_id = settle_row["payment_id"]
-            s_amt = settle_row["amount"]
+            s_amt = to_decimal(settle_row["amount"])
             exc = {
                 "order_id": s_ord_id or "UNKNOWN",
                 "payment_id": pay_id,
@@ -226,18 +253,15 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
             exception_records.append(exc)
             ledger_entries.append((
                 s_ord_id, pay_id, "EXCEPTION", 0.0, float(s_amt),
-                0.0, float(settle_row["fee"]), 0.0,
-                0.0, float(settle_row["tax"]), 0.0,
+                0.0, float(to_decimal(settle_row["fee"])), 0.0,
+                0.0, float(to_decimal(settle_row["tax"])), 0.0,
                 0.0, "ORPHAN_SETTLEMENT", exc["exception_msg"], recon_timestamp
             ))
 
     # PASS 4: Daily-to-Monthly GST ITC Safeguard Audit
-    total_daily_tax = df_settle["tax"].sum()
-    monthly_invoice_tax = 0.0
-    if not df_gst_inv.empty:
-        monthly_invoice_tax = float(df_gst_inv.iloc[0]["total_gst"])
-    
-    gst_tax_leakage = round(total_daily_tax - monthly_invoice_tax, 2)
+    total_daily_tax = sum(to_decimal(r["tax"]) for _, r in df_settle.iterrows())
+    monthly_invoice_tax = to_decimal(df_gst_inv.iloc[0]["total_gst"]) if not df_gst_inv.empty else Decimal("0.00")
+    gst_tax_leakage = float(round_curr(total_daily_tax - monthly_invoice_tax))
 
     # Persist outputs
     df_matched = pd.DataFrame(matched_records)
@@ -248,31 +272,6 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
 
     df_matched.to_csv(matched_path, index=False)
     df_exceptions.to_csv(exception_path, index=False)
-
-    # Generate and export Monthly GST ITC Discrepancy Audit Report
-    tax_report_path = OUT_DIR / "monthly-tax-audit-report.json"
-    root_tax_report_path = BASE_DIR / "monthly-tax-audit-report.json"
-    tax_report = {
-        "report_title": "PaisaGuard Monthly GST ITC Discrepancy & Tax Audit Report",
-        "audit_month": "August 2026",
-        "compliance_framework": "Section 16(2)(aa) of CGST Act / GSTR-2B Matching",
-        "audited_at": recon_timestamp,
-        "git_sha": git_sha,
-        "daily_settlement_aggregate_gst": round(float(total_daily_tax), 2),
-        "gstr2b_monthly_invoice_gst": round(float(monthly_invoice_tax), 2),
-        "detected_tax_leakage": gst_tax_leakage,
-        "status": "DISCREPANCY_DETECTED" if gst_tax_leakage != 0 else "BALANCED",
-        "recommended_action": f"Dispute notice auto-generated for \u20b9{gst_tax_leakage:.2f} excess deduction on supplier GSTR-1 discrepancy" if gst_tax_leakage > 0 else "No tax leakage detected. GSTR-2B reconciles.",
-        "details": {
-            "total_settlements_audited": len(df_settle),
-            "discrepancy_direction": "GATEWAY_OVER_DEDUCTION" if gst_tax_leakage > 0 else "NONE",
-            "risk_exposure": "Loss of eligible Input Tax Credit under GSTR-2B reconciliation"
-        }
-    }
-    with open(tax_report_path, "w") as f:
-        json.dump(tax_report, f, indent=2)
-    with open(root_tax_report_path, "w") as f:
-        json.dump(tax_report, f, indent=2)
 
     total_audited = len(df_settle)
     matched_count = len(matched_records)
@@ -290,40 +289,59 @@ def execute_reconciliation_pipeline(db_path: Path = DEFAULT_DB_PATH, reset_accum
         """, ledger_entries)
         cursor.execute("""
             INSERT INTO reconciliation_runs (
-                run_timestamp, git_sha, total_audited, matched_count, exception_count,
+                run_timestamp, git_sha, seed_hash, total_audited, matched_count, exception_count,
                 match_rate, sub_paise_accumulator, gst_daily_aggregate,
                 gst_monthly_invoice, gst_tax_leakage, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED');
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED');
         """, (
-            recon_timestamp, git_sha, total_audited, matched_count, len(exception_records),
-            round(match_rate, 2), float(rolling_sub_paise_drift), round(float(total_daily_tax), 2),
-            round(float(monthly_invoice_tax), 2), gst_tax_leakage
+            recon_timestamp, git_sha, seed_hash, total_audited, matched_count, len(exception_records),
+            round(match_rate, 2), float(rolling_sub_paise_drift), float(round_curr(total_daily_tax)),
+            float(round_curr(monthly_invoice_tax)), gst_tax_leakage
         ))
         run_id = cursor.lastrowid
+
+    # Generate and export Monthly GST ITC Discrepancy Audit Report
+    tax_report_path = OUT_DIR / "monthly-tax-audit-report.json"
+    root_tax_report_path = BASE_DIR / "monthly-tax-audit-report.json"
+    tax_report = {
+        "report_title": "PaisaGuard Monthly GST ITC Discrepancy & Tax Audit Report",
+        "audit_month": "August 2026",
+        "compliance_framework": "Section 16(2)(aa) of CGST Act / GSTR-2B Matching",
+        "audited_at": recon_timestamp,
+        "run_id": run_id,
+        "git_sha": git_sha,
+        "seed_hash": seed_hash,
+        "daily_settlement_aggregate_gst": float(round_curr(total_daily_tax)),
+        "gstr2b_monthly_invoice_gst": float(round_curr(monthly_invoice_tax)),
+        "detected_tax_leakage": gst_tax_leakage,
+        "status": "DISCREPANCY_DETECTED" if gst_tax_leakage != 0 else "BALANCED",
+        "recommended_action": f"Dispute notice auto-generated for ₹{gst_tax_leakage:.2f} excess deduction on supplier GSTR-1 discrepancy" if gst_tax_leakage > 0 else "No tax leakage detected. GSTR-2B reconciles.",
+        "details": {
+            "total_settlements_audited": len(df_settle),
+            "discrepancy_direction": "GATEWAY_OVER_DEDUCTION" if gst_tax_leakage > 0 else "NONE",
+            "risk_exposure": "Loss of eligible Input Tax Credit under GSTR-2B reconciliation"
+        }
+    }
+    with open(tax_report_path, "w") as f:
+        json.dump(tax_report, f, indent=2)
+    with open(root_tax_report_path, "w") as f:
+        json.dump(tax_report, f, indent=2)
 
     summary = {
         "run_id": run_id,
         "git_sha": git_sha,
+        "seed_hash": seed_hash,
         "total_audited": total_audited,
         "matched_count": matched_count,
         "exception_count": len(exception_records),
         "match_rate": round(match_rate, 2),
         "sub_paise_accumulator": float(rolling_sub_paise_drift),
-        "gst_daily_aggregate": round(float(total_daily_tax), 2),
-        "gst_monthly_invoice": round(float(monthly_invoice_tax), 2),
+        "gst_daily_aggregate": float(round_curr(total_daily_tax)),
+        "gst_monthly_invoice": float(round_curr(monthly_invoice_tax)),
         "gst_tax_leakage": gst_tax_leakage,
         "matched_csv": str(matched_path),
         "exception_csv": str(exception_path)
     }
-
-    # Patch run_id into the already-written JSON artifacts for auditor traceability
-    for report_path in (tax_report_path, root_tax_report_path):
-        with open(report_path, "r+") as f:
-            data = json.load(f)
-            data["run_id"] = run_id
-            f.seek(0)
-            json.dump(data, f, indent=2)
-            f.truncate()
 
     return summary
 

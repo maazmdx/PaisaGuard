@@ -6,11 +6,13 @@ import json
 import logging
 import sqlite3
 from typing import Dict, Any, Optional, Tuple
+from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Header, Request, Response, status
 from pydantic import BaseModel, Field
 from pathlib import Path
 from db import get_db_connection, get_db_cursor, DEFAULT_DB_PATH
 from recon_engine import execute_reconciliation_pipeline
+from money import to_decimal, round_curr
 
 # Configure Structured Logging
 logging.basicConfig(
@@ -32,9 +34,10 @@ if ENVIRONMENT == "production" and RAZORPAY_WEBHOOK_SECRET == "rzp_sec_buildatho
     raise RuntimeError("CRITICAL SECURITY VIOLATION: Default demo webhook secret cannot be used in production environment!")
 
 
-def verify_webhook_signature(raw_body: bytes, signature_header: str, secret: str) -> Tuple[bool, str]:
+def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str], secret: str) -> Tuple[bool, str]:
     """
-    Stateless, importable HMAC-SHA256 verification supporting both Hex and Base64 encodings.
+    Stateless, importable HMAC-SHA256 verification supporting both Hex and Base64 encodings,
+    optional 'sha256=' prefix, whitespace stripping, and case insensitivity.
 
     Compute the HMAC digest bytes ONCE and derive both representations from that
     single computation, avoiding any ambiguity from calling .hexdigest() and
@@ -43,6 +46,18 @@ def verify_webhook_signature(raw_body: bytes, signature_header: str, secret: str
     Returns:
         (verified: bool, encoding_used: str)  -- encoding_used is 'hex', 'base64', or 'none'
     """
+    if not signature_header or not isinstance(signature_header, str):
+        return False, "none"
+
+    clean_sig = signature_header.strip()
+    if clean_sig.lower().startswith("sha256="):
+        clean_sig = clean_sig[7:].strip()
+    elif clean_sig.lower().startswith("hmac="):
+        clean_sig = clean_sig[5:].strip()
+
+    if not clean_sig:
+        return False, "none"
+
     digest_bytes = hmac.new(
         secret.encode("utf-8"),
         raw_body,
@@ -51,10 +66,18 @@ def verify_webhook_signature(raw_body: bytes, signature_header: str, secret: str
     expected_hex = digest_bytes.hex()                              # 64 lowercase hex chars
     expected_b64 = base64.b64encode(digest_bytes).decode("utf-8") # 44 base64 chars with =
 
-    if hmac.compare_digest(signature_header, expected_hex):
+    # 1. Hex comparison (case-insensitive)
+    if hmac.compare_digest(clean_sig.lower(), expected_hex):
         return True, "hex"
-    if hmac.compare_digest(signature_header, expected_b64):
+
+    # 2. Base64 comparison (standard and URL-safe)
+    if hmac.compare_digest(clean_sig, expected_b64):
         return True, "base64"
+
+    expected_b64_url = base64.urlsafe_b64encode(digest_bytes).decode("utf-8")
+    if hmac.compare_digest(clean_sig.rstrip("="), expected_b64_url.rstrip("=")):
+        return True, "base64"
+
     return False, "none"
 
 class WebhookPayload(BaseModel):
@@ -150,18 +173,30 @@ async def ingest_webhook(
             entity = body_json["payload"]["payment"].get("entity", {})
             amt = entity.get("amount", 0.0)
             # In Razorpay native payload, amount is in paise (integer) if > 1000 and has no decimals
-            amt_float = float(amt) / 100.0 if isinstance(amt, int) and amt > 1000 else float(amt)
-            fee_val = entity.get("fee", 0.0)
-            fee_float = float(fee_val) / 100.0 if isinstance(fee_val, int) and fee_val > 100 else float(fee_val)
-            tax_val = entity.get("tax", 0.0)
-            tax_float = float(tax_val) / 100.0 if isinstance(tax_val, int) and tax_val > 100 else float(tax_val)
+            if isinstance(amt, int) and amt > 1000:
+                amt_dec = to_decimal(amt) / Decimal("100")
+            else:
+                amt_dec = to_decimal(amt)
+
+            fee_raw = entity.get("fee", 0.0)
+            if isinstance(fee_raw, int) and fee_raw > 100:
+                fee_dec = to_decimal(fee_raw) / Decimal("100")
+            else:
+                fee_dec = to_decimal(fee_raw)
+
+            tax_raw = entity.get("tax", 0.0)
+            if isinstance(tax_raw, int) and tax_raw > 100:
+                tax_dec = to_decimal(tax_raw) / Decimal("100")
+            else:
+                tax_dec = to_decimal(tax_raw)
+
             payload = WebhookPayload(
                 event=body_json.get("event", "payment.captured"),
                 payment_id=entity.get("id", "pay_unknown"),
                 order_id=entity.get("order_id"),
-                amount=amt_float,
-                fee=fee_float,
-                tax=tax_float,
+                amount=float(round_curr(amt_dec)),
+                fee=float(round_curr(fee_dec)),
+                tax=float(round_curr(tax_dec)),
                 payment_method=entity.get("method", "upi")
             )
         else:
@@ -169,11 +204,16 @@ async def ingest_webhook(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid webhook JSON structure: {e}")
 
-    # Defensive normalization of currency amounts (handling None/missing values safely)
-    fee_val = float(payload.fee if payload.fee is not None else 0.0)
-    tax_val = float(payload.tax if payload.tax is not None else 0.0)
-    amount_val = float(payload.amount if payload.amount is not None else 0.0)
-    net_amt = amount_val - (fee_val + tax_val)
+    # Defensive normalization of currency amounts using Decimal (handling None/missing values safely)
+    amount_dec = to_decimal(payload.amount)
+    fee_dec = to_decimal(payload.fee)
+    tax_dec = to_decimal(payload.tax)
+    net_dec = round_curr(amount_dec - (fee_dec + tax_dec))
+
+    amount_val = float(round_curr(amount_dec))
+    fee_val = float(round_curr(fee_dec))
+    tax_val = float(round_curr(tax_dec))
+    net_amt = float(net_dec)
     method_val = payload.payment_method or "upi"
     
     with get_db_cursor(DEFAULT_DB_PATH) as cursor:

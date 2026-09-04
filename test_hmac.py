@@ -53,11 +53,43 @@ def test_hex_signature_accepted():
     assert encoding == "hex"
 
 
+def test_hex_uppercase_signature_accepted():
+    """Signatures sent in uppercase hex must be normalized and verified."""
+    sig = _make_sig(PAYLOAD, SECRET, "hex").upper()
+    verified, encoding = verify_webhook_signature(PAYLOAD, sig, SECRET)
+    assert verified is True
+    assert encoding == "hex"
+
+
 def test_base64_signature_accepted():
     sig = _make_sig(PAYLOAD, SECRET, "base64")
     verified, encoding = verify_webhook_signature(PAYLOAD, sig, SECRET)
     assert verified is True
     assert encoding == "base64"
+
+
+def test_sha256_prefixed_signature_accepted():
+    """Signatures with 'sha256=' or 'hmac=' prefix should be accepted cleanly."""
+    hex_sig = _make_sig(PAYLOAD, SECRET, "hex")
+    prefixed_hex = f"sha256={hex_sig}"
+    verified, encoding = verify_webhook_signature(PAYLOAD, prefixed_hex, SECRET)
+    assert verified is True
+    assert encoding == "hex"
+
+    b64_sig = _make_sig(PAYLOAD, SECRET, "base64")
+    prefixed_b64 = f"sha256={b64_sig}"
+    verified, encoding = verify_webhook_signature(PAYLOAD, prefixed_b64, SECRET)
+    assert verified is True
+    assert encoding == "base64"
+
+
+def test_signature_with_surrounding_whitespace():
+    """Signatures with leading/trailing spaces or newlines must be trimmed cleanly."""
+    hex_sig = _make_sig(PAYLOAD, SECRET, "hex")
+    padded = f"  {hex_sig} \n"
+    verified, encoding = verify_webhook_signature(PAYLOAD, padded, SECRET)
+    assert verified is True
+    assert encoding == "hex"
 
 
 def test_both_encodings_work_for_same_payload():
@@ -94,6 +126,15 @@ def test_tampered_body_rejected():
     assert verified is False
 
 
+def test_tampered_signature_hash_rejected():
+    """A signature with an inverted byte must be rejected."""
+    correct_hex = _make_sig(PAYLOAD, SECRET, "hex")
+    # Change first character
+    tampered_sig = ("0" if correct_hex[0] != "0" else "1") + correct_hex[1:]
+    verified, _ = verify_webhook_signature(PAYLOAD, tampered_sig, SECRET)
+    assert verified is False
+
+
 def test_truncated_signature_rejected():
     """A truncated hex signature (31 chars instead of 64) must be rejected without crashing."""
     full_sig = _make_sig(PAYLOAD, SECRET, "hex")
@@ -108,10 +149,38 @@ def test_empty_signature_rejected():
     assert verified is False
 
 
+def test_none_signature_rejected():
+    """None signature must return (False, 'none') cleanly without TypeError."""
+    verified, encoding = verify_webhook_signature(PAYLOAD, None, SECRET)
+    assert verified is False
+    assert encoding == "none"
+
+
 def test_garbage_signature_rejected():
     """A random non-hex, non-base64 string must be rejected."""
     verified, _ = verify_webhook_signature(PAYLOAD, "not-a-real-sig!@#$%", SECRET)
     assert verified is False
+
+
+def test_replay_webhooks_sample_events_compatibility():
+    """Verify that all non-tampered sample events in replay_webhooks.py pass verification."""
+    from replay_webhooks import SAMPLE_EVENTS
+    for event_info in SAMPLE_EVENTS:
+        payload_bytes = json.dumps(event_info["payload"]).encode("utf-8")
+        digest = hmac.new(SECRET.encode("utf-8"), payload_bytes, hashlib.sha256).digest()
+        if event_info["encoding"] == "base64":
+            sig = base64.b64encode(digest).decode("utf-8")
+        else:
+            sig = digest.hex()
+
+        if event_info.get("tamper", False):
+            sig = "tampered_fake_signature_hash_0000000000"
+            verified, _ = verify_webhook_signature(payload_bytes, sig, SECRET)
+            assert verified is False, f"Tampered event {event_info['name']} should have been rejected"
+        else:
+            verified, enc = verify_webhook_signature(payload_bytes, sig, SECRET)
+            assert verified is True, f"Event {event_info['name']} failed verification"
+            assert enc == event_info["encoding"]
 
 
 # ---------------------------------------------------------------------------

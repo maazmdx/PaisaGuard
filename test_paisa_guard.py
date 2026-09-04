@@ -258,6 +258,7 @@ def test_defensive_webhook_payload_normalization():
     import json, hmac, hashlib
     client = TestClient(app)
 
+    # 1. Flat payload with explicit None fee and tax
     payload = {
         "event": "payment.captured",
         "payment_id": "pay_defensive_none_001",
@@ -279,6 +280,33 @@ def test_defensive_webhook_payload_normalization():
     assert resp.json()["status"] == "success"
     assert resp.json()["payment_id"] == "pay_defensive_none_001"
 
+    # 2. Nested Razorpay payload with None fee/tax
+    nested_none = {
+        "event": "payment.captured",
+        "payload": {
+            "payment": {
+                "entity": {
+                    "id": "pay_nested_none_002",
+                    "order_id": "ord_defensive_002",
+                    "amount": 150000,
+                    "fee": None,
+                    "tax": None,
+                    "method": "upi"
+                }
+            }
+        }
+    }
+    nested_bytes = json.dumps(nested_none).encode("utf-8")
+    nested_sig = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), nested_bytes, hashlib.sha256).hexdigest()
+
+    resp_nested = client.post(
+        "/webhooks/razorpay",
+        content=nested_bytes,
+        headers={"X-Razorpay-Signature": nested_sig, "Content-Type": "application/json"}
+    )
+    assert resp_nested.status_code == 200
+    assert resp_nested.json()["payment_id"] == "pay_nested_none_002"
+
 def test_prometheus_metrics_endpoint():
     """Verifies Prometheus text-format exposition endpoint."""
     from fastapi.testclient import TestClient
@@ -294,8 +322,9 @@ def test_prometheus_metrics_endpoint():
     assert "paisaguard_match_rate_percent" in text
 
 def test_accumulator_persistence_and_audit_history():
-    """Verifies that reconciliation_runs persists audit trail and tracks sub-paise accumulator across runs."""
-    import sqlite3
+    """Verifies that reconciliation_runs persists audit trail, seed_hash, and tracks sub-paise accumulator across runs."""
+    import sqlite3, json
+    from pathlib import Path
     from recon_engine import execute_reconciliation_pipeline
     from db import DEFAULT_DB_PATH
 
@@ -304,12 +333,25 @@ def test_accumulator_persistence_and_audit_history():
     run2 = execute_reconciliation_pipeline(DEFAULT_DB_PATH, reset_accumulator=False)
 
     conn = sqlite3.connect(str(DEFAULT_DB_PATH))
-    runs = conn.execute("SELECT run_id, sub_paise_accumulator, status FROM reconciliation_runs ORDER BY run_id DESC").fetchall()
+    runs = conn.execute("SELECT run_id, sub_paise_accumulator, git_sha, seed_hash, status FROM reconciliation_runs ORDER BY run_id DESC").fetchall()
     conn.close()
 
     assert len(runs) >= 2
-    assert runs[0][2] == "COMPLETED"
+    assert runs[0][4] == "COMPLETED"
     assert isinstance(runs[0][1], float)
+    # Check seed_hash provenance persistence
+    assert runs[0][3].startswith("sha256:")
+    assert len(runs[0][2]) > 0
+
+    # Verify monthly-tax-audit-report.json has run_id, git_sha, and seed_hash
+    report_path = Path(__file__).resolve().parent / "monthly-tax-audit-report.json"
+    assert report_path.exists()
+    with open(report_path) as f:
+        report_data = json.load(f)
+    assert "run_id" in report_data
+    assert "seed_hash" in report_data
+    assert report_data["seed_hash"].startswith("sha256:")
+    assert "git_sha" in report_data
 
 def test_concurrency_benchmark_artifact_generation():
     """Verifies that the benchmark runner generates out/concurrency-benchmark.json with zero lock errors in WAL mode."""

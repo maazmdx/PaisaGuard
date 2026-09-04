@@ -1,14 +1,9 @@
 import random
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from datetime import datetime, timedelta
 from pathlib import Path
 from db import init_db, get_db_cursor, DEFAULT_DB_PATH
-
-TWO_PLACES = Decimal("0.01")
-FOUR_PLACES = Decimal("0.0001")
-
-def round_curr(val: Decimal) -> Decimal:
-    return val.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+from money import to_decimal, round_curr, calc_mdr_fee_and_tax
 
 def generate_financial_dataset(db_path: Path = DEFAULT_DB_PATH):
     """

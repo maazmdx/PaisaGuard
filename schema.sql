@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_timestamp TEXT NOT NULL,
     git_sha TEXT DEFAULT 'local',
+    seed_hash TEXT DEFAULT 'sha256:none',
     total_audited INTEGER NOT NULL,
     matched_count INTEGER NOT NULL,
     exception_count INTEGER NOT NULL,
