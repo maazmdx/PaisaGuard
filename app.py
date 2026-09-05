@@ -773,7 +773,7 @@ with tab_benchmarks:
 
             st.markdown(f"- **WAL Mode Concurrency**: `{wal_res}`")
             st.markdown(f"- **Rollback Mode Locks**: `{rb_res}`")
-            st.markdown(f"- **SQLite Journal Mode**: `WAL (Write-Ahead-Log)`")
+            st.markdown("- **SQLite Journal Mode**: `WAL (Write-Ahead-Log)`")
             st.markdown(f"- **Platform**: `{platform_str}` ({cpu_str} vCPUs)")
             st.markdown(f"- **Python Version**: `Python {py_str}`")
             st.markdown(f"- **Git SHA**: `{prov.get('git_sha', 'local')}`")
