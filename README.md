@@ -240,6 +240,8 @@ ruff check . && ruff format --check .
 
 ```text
 PaisaGuard/
+├── docs/
+│   └── ARCHITECTURE.md  # Detailed architecture and engineering blueprint
 ├── api.py               # FastAPI gateway, webhooks, security headers, and read APIs
 ├── app.py               # Streamlit FinOps operator console (HTTP-only)
 ├── recon_engine.py      # Deterministic 3-way reconciliation engine (Passes 1–4)
