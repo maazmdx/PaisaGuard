@@ -46,8 +46,8 @@ logger = logging.getLogger("paisaguard.agent")
 def normalize_model_name(raw: Optional[str], provider: str = "gemini") -> str:
     cleaned = (raw or "").strip()
     if provider == "groq":
-        if not cleaned or cleaned.startswith("gemini-") or cleaned.startswith("models/"):
-            return "llama-3.3-70b-versatile"
+        if not cleaned or "llama" in cleaned.lower() or cleaned.startswith("gemini-") or cleaned.startswith("models/"):
+            return "groq/compound"
         return cleaned
     c_lower = cleaned.lower()
     if not cleaned or "llama" in c_lower:
@@ -353,7 +353,7 @@ class GroqProvider(BaseAIProvider):
     - Fails closed if GROQ_API_KEY is not set.
     """
 
-    def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile"):
+    def __init__(self, api_key: str, model_name: str = "groq/compound"):
         if not api_key:
             raise ValueError("FinOps Configuration Violation: GROQ_API_KEY must be provided when AI_PROVIDER='groq'.")
         self.api_key = api_key
@@ -386,7 +386,7 @@ class GroqProvider(BaseAIProvider):
         }
 
         models_to_try = [self.model_name]
-        for fallback in ["llama-3.3-70b-versatile", "groq/compound", "groq/compound-mini"]:
+        for fallback in ["groq/compound", "groq/compound-mini", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]:
             if fallback not in models_to_try:
                 models_to_try.append(fallback)
 
@@ -425,7 +425,7 @@ def get_ai_provider() -> BaseAIProvider:
         api_key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY_ENV).strip()
         if not api_key:
             raise RuntimeError("CRITICAL ERROR: AI_PROVIDER='groq' configured but GROQ_API_KEY is unset.")
-        raw_model = os.environ.get("AI_MODEL", AI_MODEL_ENV) or "llama-3.3-70b-versatile"
+        raw_model = os.environ.get("AI_MODEL", AI_MODEL_ENV) or "groq/compound"
         return GroqProvider(api_key=api_key, model_name=normalize_model_name(raw_model, provider="groq"))
     if provider_name == "gemini":
         api_key = os.environ.get("AI_API_KEY", AI_API_KEY_ENV).strip()
@@ -742,7 +742,7 @@ def check_ai_preflight() -> Dict[str, Any]:
             "max_tokens": 5,
         }
         models_to_check = [model_name]
-        for fallback in ["llama-3.3-70b-versatile", "groq/compound", "groq/compound-mini"]:
+        for fallback in ["groq/compound", "groq/compound-mini", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]:
             if fallback not in models_to_check:
                 models_to_check.append(fallback)
 

@@ -58,6 +58,7 @@ venv.bak/
 .env.*.local
 *.pem
 *.key
+*.log
 
 # SQLite database binaries & WAL journals (generated via seed_data.py)
 *.db

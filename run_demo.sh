@@ -88,14 +88,17 @@ echo -e "\n[4/5] Executing automated verification test suite & benchmarks..."
 AI_PROVIDER=mock pytest -q
 AI_PROVIDER=mock python3 eval_benchmarks.py
 
+# Prepare clean operational ledger for live demo walkthrough (unresolved exceptions ready for investigation)
+python3 seed_data.py --reset > /dev/null 2>&1
+python3 recon_engine.py > /dev/null 2>&1
+
 echo -e "\n=== PaisaGuard Runtime Configuration ==="
 echo -e "-> API Token          : [CONFIGURED]"
 echo -e "-> Webhook Secret     : [CONFIGURED]"
 echo -e "-> AI Provider        : ${AI_PROVIDER}"
 if [ "$AI_PROVIDER" = "groq" ]; then
-    echo -e "-> Groq API Key       : [CONFIGURED]"
-    groq_model="${AI_MODEL:-llama-3.3-70b-versatile}"
-    if [[ "$groq_model" == gemini* ]]; then groq_model="llama-3.3-70b-versatile"; fi
+    groq_model="${AI_MODEL:-groq/compound}"
+    if [[ "$groq_model" == gemini* || "$groq_model" == llama* ]]; then groq_model="groq/compound"; fi
     echo -e "-> Groq Model         : ${groq_model}"
 elif [ -n "${GROQ_API_KEY:-}" ]; then
     echo -e "-> Groq API Key       : [CONFIGURED]"

@@ -552,6 +552,7 @@ def get_metrics():
         total_oms = conn.execute("SELECT COUNT(*) FROM oms_orders").fetchone()[0]
         total_settle = conn.execute("SELECT COUNT(*) FROM razorpay_settlements").fetchone()[0]
         total_bank_cr = conn.execute("SELECT COUNT(*) FROM bank_payout_credits").fetchone()[0]
+        total_webhook = conn.execute("SELECT COUNT(*) FROM webhook_events").fetchone()[0]
 
         total_volume_paise = conn.execute("SELECT COALESCE(SUM(amount_paise), 0) FROM razorpay_settlements").fetchone()[
             0
@@ -579,17 +580,23 @@ def get_metrics():
 
         total_tx = matched_tx + exception_tx
         total_p = matched_payouts + exception_payouts
+        total_src = total_oms + total_settle + total_bank_cr + total_webhook
 
         return {
             "counts": {
                 "oms_orders": total_oms,
                 "settlements": total_settle,
+                "razorpay_settlements": total_settle,
                 "bank_credits": total_bank_cr,
+                "bank_payout_credits": total_bank_cr,
+                "webhook_events": total_webhook,
+                "total_source_records": total_src,
                 "total_volume_paise": total_volume_paise,
                 "total_volume_inr": format_paise_inr(total_volume_paise),
             },
             "transaction_metrics": {
                 "total_transactions": total_tx,
+                "total_business_transactions": total_tx,
                 "matched_count": matched_tx,
                 "exception_count": exception_tx,
                 "match_rate_percent": round((matched_tx / total_tx) * 100, 2) if total_tx > 0 else 0.0,
@@ -701,6 +708,9 @@ def get_exceptions():
                 d.variance_paise,
                 d.evidence_json,
                 d.current_disposition,
+                d.resolved_by,
+                d.resolution_notes,
+                d.resolved_at,
                 d.decision_created_at
             FROM v_current_decisions d
             WHERE d.match_status = 'EXCEPTION'
@@ -724,6 +734,9 @@ def get_exceptions():
                     "variance_inr": format_paise_inr(r["variance_paise"]),
                     "evidence": json.loads(r["evidence_json"]) if r["evidence_json"] else {},
                     "current_disposition": r["current_disposition"],
+                    "resolved_by": r["resolved_by"],
+                    "resolution_notes": r["resolution_notes"],
+                    "resolved_at": r["resolved_at"],
                     "created_at": r["decision_created_at"],
                 }
             )
@@ -780,7 +793,16 @@ def get_evaluation_report():
         }
     try:
         with open(report_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+
+        conc_file = OUT_DIR / "concurrency-benchmark.json"
+        if conc_file.exists():
+            try:
+                with open(conc_file, "r", encoding="utf-8") as cf:
+                    data["concurrency_benchmark"] = json.load(cf)
+            except Exception:
+                pass
+        return data
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read evaluation report: {exc}")
 
