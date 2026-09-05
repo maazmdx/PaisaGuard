@@ -3,6 +3,13 @@
 **Deterministic Three-Way Payment Reconciliation & Guarded AI Exception Controller**  
 *Built for the Razorpay AI Buildathon 2026 — Track 04: AI Finance Controller*
 
+[![5-Minute Pitch Video](https://img.shields.io/badge/YouTube-5--Minute%20Pitch%20Video-red?style=for-the-badge&logo=youtube)](https://youtu.be/dOqt8ezLx94)
+[![Architecture](https://img.shields.io/badge/Docs-Architecture%20Blueprint-blue?style=for-the-badge)](docs/ARCHITECTURE.md)
+[![Tests](https://img.shields.io/badge/Tests-46%2F46%20Passing-brightgreen?style=for-the-badge)](test_paisa_guard.py)
+[![License](https://img.shields.io/badge/License-MIT-purple?style=for-the-badge)](LICENSE)
+
+> 📺 **Official 5-Minute Pitch & Walkthrough Video**: [https://youtu.be/dOqt8ezLx94](https://youtu.be/dOqt8ezLx94)
+
 ---
 
 > **Core Philosophy**: Deterministic logic balances the financial ledger. Guarded AI explains the anomalies. Humans make the final decisions.
@@ -129,6 +136,30 @@ Evaluated against a synthetic 3-source dataset (100 operational transactions + 3
 
 ---
 
+## What Broke at 2 AM (And How We Engineered the Fix)
+
+Building high-throughput financial infrastructure under hackathon pressure exposes edge cases that trivial prototypes ignore. Here are the 4 real architectural breakages we hit at 2 AM and the engineering fixes that made PaisaGuard production-grade:
+
+### 1. The Floating-Point Paise Catastrophe (`0.1 + 0.2 != 0.3`)
+* **What broke at 2 AM**: Initial reconciliation logic stored order amounts, gateway fees, and taxes as standard floating-point numbers (`REAL`). During 3-way summation across 100 orders, IEEE-754 precision drift corrupted fee math (e.g. ₹1,499.00 at 2.0% MDR + 18% GST evaluated to `35.376400000000005` instead of `35.38`). Balanced transactions were falsely flagged as `FEE_TAX_DISCREPANCY` exceptions, ruining ledger integrity.
+* **How we engineered the fix**: Rebuilt the monetary core around **Canonical Integer Paise** (`*_paise`) across OMS records, Razorpay payloads, and bank payout credits (`money.py`). Floating-point money was completely eliminated. All calculations enforce banker's rounding (`ROUND_HALF_UP`) directly to integer paise before persisting to the ledger.
+
+### 2. The 50-Webhook Lockout Crash (`database is locked`)
+* **What broke at 2 AM**: Simulating realistic burst traffic (50 concurrent webhook payloads from Razorpay) caused SQLite to throw `sqlite3.OperationalError: database is locked`. Under SQLite's default rollback journal (`DELETE` mode), writers block all readers and subsequent writers. Only **19 of 50 concurrent commits** succeeded (31 database lockouts, 62% failure rate).
+* **How we engineered the fix**: Upgraded the storage engine to **SQLite WAL Mode (Write-Ahead Log)** with `PRAGMA busy_timeout = 5000` and `PRAGMA synchronous = NORMAL` (`db.py`). We created an automated adversarial benchmark harness (`concurrency_tester.py`) that proved **50 / 50 successful concurrent commits (100% throughput, 0 locks)**.
+
+### 3. LLM Hallucination & Groq 404 Endpoint Deprecation
+* **What broke at 2 AM**: When querying the exception agent during high-stress testing, the cloud model attempted to invent phantom credit settlements or suggest direct financial ledger balance mutations. Worse, Groq deprecated `llama-3.3-70b-versatile`, returning sudden 404 errors that caused 16-second retry delays and frontend UI timeouts.
+* **How we engineered the fix**:
+  1. Implemented the **Deterministic Policy Safety Gate** (`policy_gate.py`) with hard mathematical ceilings (₹50.00 / 5,000 paise variance cap, 3.50% MDR limit, and action whitelist). Even if an LLM hallucinates an unsafe adjustment, the policy gate intercepts the payload and enforces an audited abstention.
+  2. Upgraded provider configuration to `groq/compound` with fallback resilience and expanded HTTP client timeout to 45 seconds. The AI has **zero write permissions** to the financial ledger.
+
+### 4. The Ghost Decision Race Condition (Audit State Destruction)
+* **What broke at 2 AM**: When multiple FinOps operators reviewed open exceptions, executing direct SQL `UPDATE` queries on `reconciliation_decisions` caused race conditions, lost previous operator notes, and violated financial auditability standards.
+* **How we engineered the fix**: Converted the audit architecture into an **immutable, append-only event store** (`audit_service.py`). Human resolutions (`APPROVE`, `REJECT`, `ESCALATE`) are written strictly as append-only `INSERT` operations. The current reconciliation queue is dynamically projected via an indexed SQL view (`v_current_decisions`). Destructive updates were completely eradicated.
+
+---
+
 ## Quick Start (One-Click Launcher)
 
 **Prerequisites**: Linux / macOS, Python 3.12, bash, curl.
@@ -164,10 +195,10 @@ To run the automated verification and signed webhook demonstration and exit clea
 
 PaisaGuard supports **Groq**, **Gemini**, and an offline **Mock** baseline. Configure your provider in `.env`:
 
-### Option A: Groq (Recommended for Speed & Llama 3.3)
+### Option A: Groq (Recommended for Speed & Compound Routing)
 ```env
 AI_PROVIDER=groq
-AI_MODEL=llama-3.3-70b-versatile
+AI_MODEL=groq/compound
 GROQ_API_KEY=gsk_your_groq_api_key_here
 ```
 
